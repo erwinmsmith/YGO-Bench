@@ -1,4 +1,4 @@
-# YGO-Bench
+# YGO-Bench / 游戏王 LLM Benchmark
 
 YGO-Bench 是一套面向 LLM agent 的游戏王规则交互 benchmark。项目借鉴
 PTCG-Bench 的 agent/environment/evaluation 分层，但规则裁决交给真实的
@@ -14,7 +14,38 @@ EDOPro `ocgcore`，不在 Python 中重新实现卡片效果。
 - 完整对局的 passive、random、LLM/ReAct agent 与换边 Arena；
 - 牌桌级可视化回放，支持逐步、倍速、时间轴和卡片详情。
 
-## 架构
+## English
+
+YGO-Bench is a reproducible benchmark for LLM agents playing Yu-Gi-Oh!. It
+combines the PTCG-Bench-style agent/evaluation layers with the real EDOPro
+`ocgcore` rules engine, CardScripts, BabelCDB, deterministic decks, and a
+frame-by-frame visual replay UI.
+
+The benchmark supports puzzle solving, full-duel tool use, N-attempt plans,
+passive/random/ReAct agents, round-robin Arena matches, token and latency
+metrics, illegal-action tracking, and hidden-information filtering. Player 1
+is always rendered at the bottom of the replay board and Player 2 at the top.
+
+Quick start:
+
+```bash
+uv sync --extra dev
+uv run ygo-bench setup
+uv run ygo-bench doctor
+
+# terminal 1
+uv run ygo-bench-api
+
+# terminal 2
+cd frontend && npm install && npm run dev
+```
+
+Open `http://localhost:5173/?view=replays` to inspect LP, hands, field zones,
+graveyards, chains, phases, agent actions, and card details. See
+[`docs/BENCHMARK_PROTOCOL.md`](docs/BENCHMARK_PROTOCOL.md) for the protocol and
+the Chinese sections below for the complete command reference.
+
+## 架构 / Architecture
 
 ```text
 LLM / rule / RL agent
@@ -36,7 +67,7 @@ EDOPro 仓库本身是 GUI 客户端。本项目只使用其规则核心相关�
 `ygopro-core`、CardScripts、BabelCDB。`vendor/yugi-bench` 是固定提交的
 Apache-2.0 引擎适配与谜题验证基座。
 
-## 安装
+## 安装 / Installation
 
 ```bash
 cd /Users/erwin/Downloads/codespace/YGO
@@ -53,7 +84,7 @@ uv run ygo-bench doctor
 如果系统没有 `premake5`，YGO-Bench 会把固定版本下载到项目内的 `.tools/`，
 不会修改系统安装。
 
-## Web 实验台
+## Web 实验台 / Web Lab
 
 启动 FastAPI：
 
@@ -89,7 +120,7 @@ uv run python scripts/sync_decks.py
 
 回放帧来自 JSONL 中真实 ocgcore observation，不会在前端推演或伪造卡片状态。
 
-### 回放展示
+### 回放展示 / Replay Gallery
 
 下面的素材来自一场 **BlueEyes vs BlueEyes** 的双 LLM 完整对局（seed `79`）。
 玩家 1 固定在下方、玩家 2 固定在上方；右侧动作时间线可以定位到任意一次
@@ -97,13 +128,21 @@ uv run python scripts/sync_decks.py
 
 ![Blue-Eyes 双 LLM 回放截图](docs/assets/replay-seed79.png)
 
-![Blue-Eyes 双 LLM 回放 GIF](docs/assets/replay-overview.gif)
+#### 回放 GIF / Replay GIFs
+
+| 开局 / Opening | 中段 / Mid-game |
+| --- | --- |
+| ![Opening replay](docs/assets/replay-opening.gif) | ![Mid-game replay](docs/assets/replay-midgame.gif) |
+
+| 终局 / Endgame | 总览 / Overview |
+| --- | --- |
+| ![Endgame replay](docs/assets/replay-endgame.gif) | ![Replay overview](docs/assets/replay-overview.gif) |
 
 这场回放共 12 回合、445 次决策，玩家 2 获胜（LP `0 - 8000`），双方非法动作数和
 协议 fallback 均为 `0`。原始 JSONL 会写入本地 `bench_data/runs/`，默认被 Git
 忽略；仓库只提交轻量的展示素材，避免把运行日志和 API 凭据上传。
 
-## 运行评测
+## 运行评测 / Evaluation
 
 先复制 `.env.example` 为 `.env`，填写对应模型的 API key。本工作区已从
 相邻 PTCG 项目复制兼容的 `.env`（文件权限 `600`，不会提交到 Git）。
@@ -197,7 +236,7 @@ token、Elo、Glicko-2、先后手分层胜率与 deck matchup matrix。完整�
 uv run ygo-bench report bench_data/runs/<run-name>/_summary.json
 ```
 
-## 指标
+## 指标 / Metrics
 
 残局任务的主指标是 `solve_rate`。同时记录：
 
@@ -215,7 +254,7 @@ matchup matrix。不要把不同卡池、禁限卡表、规则核心
 并只暴露当前 responder 的 schema 与 `inspect_card`；系统要求模型恰好提交一次
 响应工具调用。工具索引只在当前 observation 有效，下一步不得复用。
 
-## 开发
+## 开发 / Development
 
 ```bash
 uv run pytest
@@ -225,7 +264,7 @@ uv run ruff check .
 第三方许可证和商标声明见 `NOTICE`。研究结果发布时，应记录本仓库提交、
 submodule 提交、ocgcore/CardScripts/BabelCDB 提交、数据集版本和运行配置。
 
-## 资源来源
+## 资源来源 / Resources
 
 - 规则核心：[edo9300/ygopro-core](https://github.com/edo9300/ygopro-core)
 - 卡片脚本：[ProjectIgnis/CardScripts](https://github.com/ProjectIgnis/CardScripts)
