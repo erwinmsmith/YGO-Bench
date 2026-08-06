@@ -1,0 +1,2 @@
+"""YGO-Bench FastAPI backend."""
+

@@ -1,0 +1,25 @@
+YGO-Bench integrates third-party projects without changing their licenses.
+
+* vendor/yugi-bench is yugi-bench-v1, licensed under Apache-2.0.
+  Source: https://github.com/yugi-bench/yugi-bench-v1
+* vendor/ygo-agent is ygo-agent, licensed under MIT/Apache-2.0. The curated
+  .ydk files under resources/decks are unmodified copies from that repository.
+  Source: https://github.com/sbl1996/ygo-agent
+* vendor/lflists and the copied .lflist.conf files come from Project Ignis
+  LFLists. Source: https://github.com/ProjectIgnis/LFLists
+* frontend/public/card-back.png and duel-field.png are unmodified Project
+  Ignis Distribution assets, whose repository is AGPL-3.0.
+  Source: https://github.com/ProjectIgnis/Distribution
+* yugi-bench's setup process fetches pinned revisions of EDOPro ygopro-core
+  and Project Ignis CardScripts, licensed under AGPL-3.0-or-later.
+* BabelCDB and ProjectIgnis/Puzzles remain upstream data/resources and retain
+  their respective notices and terms.
+
+The MIT license in this repository applies only to original YGO-Bench code.
+See vendor/yugi-bench/LICENSE and vendor/yugi-bench/NOTICE before
+redistributing source, containers, compiled engine libraries, card scripts,
+databases, or generated datasets.
+
+Yu-Gi-Oh! is a trademark of Konami Digital Entertainment Co., Ltd. This
+research project is not affiliated with, endorsed by, or sponsored by Konami,
+Shueisha, or Project Ignis.

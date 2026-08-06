@@ -1,0 +1,59 @@
+{
+  "BlueEyes": {
+    "name": "Blue-Eyes",
+    "archetype": "Dragon / Beatdown",
+    "difficulty": "starter",
+    "accent": "#8fd3ff",
+    "description": "以青眼白龙为核心的直观高打点套牌，适合验证召唤、检索与战斗阶段。"
+  },
+  "CyberDragon": {
+    "name": "Cyber Dragon",
+    "archetype": "Machine / OTK",
+    "difficulty": "intermediate",
+    "accent": "#b8f1ff",
+    "description": "擅长后攻突破与融合斩杀，用于测试目标选择和伤害规划。"
+  },
+  "Hero": {
+    "name": "HERO",
+    "archetype": "Warrior / Combo",
+    "difficulty": "intermediate",
+    "accent": "#ffb36b",
+    "description": "多路线融合展开，适合评估长序列规划与额外牌组管理。"
+  },
+  "SkyStrikerAce": {
+    "name": "Sky Striker Ace",
+    "archetype": "Spell / Control",
+    "difficulty": "advanced",
+    "accent": "#ff6f61",
+    "description": "资源循环与精细交互型套牌，强调信息利用和时点判断。"
+  },
+  "Branded": {
+    "name": "Branded",
+    "archetype": "Fusion / Midrange",
+    "difficulty": "advanced",
+    "accent": "#d95645",
+    "description": "围绕烙印融合构筑的中速体系，用于测试连锁和融合素材选择。"
+  },
+  "Labrynth": {
+    "name": "Labrynth",
+    "archetype": "Trap / Control",
+    "difficulty": "advanced",
+    "accent": "#e99cc8",
+    "description": "陷阱驱动的控制套牌，适合评估对手回合决策与延迟收益。"
+  },
+  "SnakeEyeFire": {
+    "name": "Snake-Eye Fire King",
+    "archetype": "Combo / Midrange",
+    "difficulty": "expert",
+    "accent": "#ff553d",
+    "description": "高分支现代展开体系，用于压力测试长上下文和资源追踪。"
+  },
+  "TenyiSword": {
+    "name": "Tenyi Swordsoul",
+    "archetype": "Synchro / Midrange",
+    "difficulty": "advanced",
+    "accent": "#72d5a5",
+    "description": "稳定的同步召唤体系，兼顾展开、阻抗和后续资源。"
+  }
+}
+

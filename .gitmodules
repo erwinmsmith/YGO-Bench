@@ -1,0 +1,9 @@
+[submodule "vendor/yugi-bench"]
+	path = vendor/yugi-bench
+	url = https://github.com/yugi-bench/yugi-bench-v1.git
+[submodule "vendor/ygo-agent"]
+	path = vendor/ygo-agent
+	url = https://github.com/sbl1996/ygo-agent.git
+[submodule "vendor/lflists"]
+	path = vendor/lflists
+	url = https://github.com/ProjectIgnis/LFLists.git
