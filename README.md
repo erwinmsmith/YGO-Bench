@@ -1,7 +1,7 @@
 # YGO-Bench
 [Chinese README](README.zh-CN.md)
 
-YGO-Bench is a reproducible benchmark for LLM agents playing Yu-Gi-Oh!. It
+YGO-Bench is a benchmark for LLM agents playing Yu-Gi-Oh!. It
 combines the PTCG-Bench-style agent/evaluation layers with the real EDOPro
 `ocgcore` rules engine, CardScripts, BabelCDB, deterministic decks, and a
 frame-by-frame visual replay UI.
