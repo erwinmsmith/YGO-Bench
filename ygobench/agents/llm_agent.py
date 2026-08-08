@@ -4,10 +4,15 @@ from __future__ import annotations
 
 import json
 import sys
+from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from ygobench.agents.base import BaseAgent
+from ygobench.agents.provider_limits import (
+    omit_deepseek_token_limit,
+    scrub_reasoning_content,
+)
 from ygobench.config import ModelConfig
 from ygobench.engine.protocol import ActionChoice, DecisionRequest
 from ygobench.engine.upstream import UpstreamLayout
@@ -113,7 +118,7 @@ class LLMFullDuelAgent(BaseAgent):
         self,
         model: ModelConfig,
         *,
-        max_tokens: int = 32768,
+        max_tokens: int | None = None,
         temperature: float = 0.0,
         max_inspections: int = 8,
         max_forced_retries: int = 2,
@@ -121,10 +126,14 @@ class LLMFullDuelAgent(BaseAgent):
         profile: str = "react",
     ) -> None:
         tools_module, get_provider = _provider_runtime()
-        kwargs: dict[str, Any] = {"max_tokens": max_tokens, "temperature": temperature}
+        kwargs: dict[str, Any] = {"temperature": temperature}
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
         if model.base_url:
             kwargs["base_url"] = model.base_url
         self._provider = get_provider(model.provider, model.model, **kwargs)
+        if model.provider == "deepseek" and max_tokens is None:
+            omit_deepseek_token_limit(self._provider)
         if model.provider == "deepseek" and not thinking_enabled:
             self._provider.reasoning_effort = None
             self._provider.thinking_enabled = False
@@ -183,8 +192,18 @@ class LLMFullDuelAgent(BaseAgent):
         inspections = 0
         forced_retries = 0
         traces: list[dict[str, Any]] = []
+        requests: list[dict[str, Any]] = []
 
         while inspections <= self._max_inspections:
+            requests.append(
+                scrub_reasoning_content(
+                    {
+                    "system": active_system_prompt,
+                    "messages": deepcopy(messages),
+                    "tools": deepcopy(available_tools),
+                    }
+                )
+            )
             turn = self._provider.respond(
                 system=active_system_prompt,
                 messages=messages,
@@ -200,12 +219,14 @@ class LLMFullDuelAgent(BaseAgent):
                 "stop_reason": turn.stop_reason,
                 "usage": turn.usage,
                 "elapsed_seconds": turn.wallclock_seconds,
-                "provider_data": turn.provider_data,
+                # Keep provider reasoning only in the live conversation below;
+                # never persist it in evidence logs.
+                "provider_data": scrub_reasoning_content(turn.provider_data),
             }
             traces.append(trace)
             action_call = next((call for call in turn.tool_calls if call.name == responder), None)
             if action_call is not None:
-                self.last_trace = {"turns": traces, "fallback": False}
+                self.last_trace = {"requests": requests, "turns": traces, "fallback": False}
                 return ActionChoice(
                     tool=action_call.name,
                     arguments=action_call.arguments,
@@ -280,6 +301,7 @@ class LLMFullDuelAgent(BaseAgent):
 
         self.invalid_outputs += 1
         self.last_trace = {
+            "requests": requests,
             "turns": traces,
             "fallback": True,
             "error": "model did not call required responder",

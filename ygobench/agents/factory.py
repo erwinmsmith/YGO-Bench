@@ -20,7 +20,6 @@ def create_agent(agent_id: str, *, seed: int = 0) -> BaseAgent:
         model = parts[2] if len(parts) > 2 and parts[2] else None
         return LLMFullDuelAgent(
             default_model_config(provider, model),
-            max_tokens=32768,
             thinking_enabled=False,
             profile="react-fast",
         )

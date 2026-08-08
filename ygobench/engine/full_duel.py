@@ -74,13 +74,15 @@ def _parse_deck(path: Path) -> dict[str, list[int]]:
     return sections
 
 
-def _create_match(engine, core, *, seed: int, flags: int) -> None:
+def _derive_engine_seeds(seed: int) -> tuple[int, int, int, int]:
     rng = random.Random(seed)
+    return tuple(rng.getrandbits(64) for _ in range(4))  # type: ignore[return-value]
+
+
+def _create_match(engine, core, *, seed: int, flags: int) -> tuple[int, int, int, int]:
+    engine_seeds = _derive_engine_seeds(seed)
     options = core.OCG_DuelOptions()
-    options.seed0 = rng.getrandbits(64)
-    options.seed1 = rng.getrandbits(64)
-    options.seed2 = rng.getrandbits(64)
-    options.seed3 = rng.getrandbits(64)
+    options.seed0, options.seed1, options.seed2, options.seed3 = engine_seeds
     options.flags = flags
     options.team1 = core.OCG_Player(startingLP=8000, startingDrawCount=5, drawCountPerTurn=1)
     options.team2 = core.OCG_Player(startingLP=8000, startingDrawCount=5, drawCountPerTurn=1)
@@ -102,6 +104,7 @@ def _create_match(engine, core, *, seed: int, flags: int) -> None:
     engine._log_messages = []
     engine._load_script("constant.lua")
     engine._load_script("utility.lua")
+    return engine_seeds
 
 
 def _add_deck(engine, core, *, player: int, deck: dict[str, list[int]]) -> None:
@@ -355,9 +358,7 @@ def run_duel(
             "termination": termination,
             "game_over": logical_game_over,
             "winner": winner_value,
-            "winner_agent": (
-                agents[winner_value].name if winner_value is not None else None
-            ),
+            "winner_agent": (agents[winner_value].name if winner_value is not None else None),
             "turn_count": duel.state.turn_count,
             "lp": list(duel.state.lp),
             "tool_calls_used": decisions,
