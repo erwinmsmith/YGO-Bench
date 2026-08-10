@@ -200,33 +200,44 @@ def compute_probe_metrics(run_dir: Path) -> dict[str, Any]:
         "parse_failure_rate": (len(state_rows) - len(valid_state)) / max(1, len(state_rows)),
     }
 
-    valid_forecast = [
-        row
-        for row in forecast_rows
-        if isinstance(row.get("probability"), (int, float)) and 0 <= row["probability"] <= 1
-    ]
-    y = np.array([row["ground_truth"] for row in valid_forecast], dtype=int)
-    p = np.array([row["probability"] for row in valid_forecast], dtype=float)
-    ece = None
-    if len(y):
-        total = 0.0
-        for low in np.linspace(0, 0.9, 10):
-            mask = (p >= low) & (p < low + 0.1 if low < 0.9 else p <= 1)
-            if mask.any():
-                total += mask.mean() * abs(p[mask].mean() - y[mask].mean())
-        ece = float(total)
-    both_classes = len(set(y.tolist())) == 2
+    def forecast_metrics(truth_key: str, probability_key: str) -> dict[str, Any]:
+        valid = [
+            row
+            for row in forecast_rows
+            if row.get(truth_key) in (0, 1)
+            and isinstance(row.get(probability_key), (int, float))
+            and 0 <= row[probability_key] <= 1
+        ]
+        y = np.array([row[truth_key] for row in valid], dtype=int)
+        p = np.array([row[probability_key] for row in valid], dtype=float)
+        ece = None
+        if len(y):
+            total = 0.0
+            for low in np.linspace(0, 0.9, 10):
+                mask = (p >= low) & (p < low + 0.1 if low < 0.9 else p <= 1)
+                if mask.any():
+                    total += mask.mean() * abs(p[mask].mean() - y[mask].mean())
+            ece = float(total)
+        both_classes = len(set(y.tolist())) == 2
+        return {
+            "samples": len(forecast_rows),
+            "valid_samples": len(valid),
+            "prevalence": float(y.mean()) if len(y) else None,
+            "auprc": float(average_precision_score(y, p)) if both_classes else None,
+            "auroc": float(roc_auc_score(y, p)) if both_classes else None,
+            "brier_score": float(brier_score_loss(y, p)) if len(y) else None,
+            "ece_10_equal_width": ece,
+            "parse_failure_rate": (len(forecast_rows) - len(valid))
+            / max(1, len(forecast_rows)),
+        }
+
     exp5 = {
         "experiment": 5,
-        "samples": len(forecast_rows),
-        "valid_samples": len(valid_forecast),
-        "prevalence": float(y.mean()) if len(y) else None,
-        "auprc": float(average_precision_score(y, p)) if both_classes else None,
-        "auroc": float(roc_auc_score(y, p)) if both_classes else None,
-        "brier_score": float(brier_score_loss(y, p)) if len(y) else None,
-        "ece_10_equal_width": ece,
-        "parse_failure_rate": (len(forecast_rows) - len(valid_forecast))
-        / max(1, len(forecast_rows)),
+        "primary_target": "availability",
+        "availability": forecast_metrics(
+            "availability_ground_truth", "availability_probability"
+        ),
+        "behavior": forecast_metrics("behavior_ground_truth", "behavior_probability"),
     }
     atomic_write_json(run_dir / "metrics" / "exp3" / "metrics.json", exp3)
     atomic_write_json(run_dir / "metrics" / "exp5" / "metrics.json", exp5)
