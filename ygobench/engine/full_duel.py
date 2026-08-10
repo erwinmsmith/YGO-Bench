@@ -19,6 +19,7 @@ from ygobench.agents.passive_agent import PassiveAgent
 from ygobench.config import PROJECT_ROOT
 from ygobench.engine.protocol import ActionChoice, DecisionRequest
 from ygobench.engine.upstream import UpstreamLayout
+from ygobench.engine.upstream_fixes import apply_upstream_fixes
 from ygobench.engine.visibility import sanitize_events_for_player
 
 
@@ -53,6 +54,7 @@ def _load_upstream():
         sys.path.insert(0, source)
     from engine import core, harness, replay, state, tools  # type: ignore[import-not-found]
 
+    apply_upstream_fixes(core, state)
     return layout, core, harness, replay, state, tools
 
 
