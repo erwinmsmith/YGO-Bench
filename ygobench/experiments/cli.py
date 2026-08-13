@@ -11,7 +11,10 @@ from ygobench.experiments.capabilities import inspect_capabilities
 from ygobench.experiments.config import ExperimentConfig
 from ygobench.experiments.metrics import compute_phase2_metrics, compute_probe_metrics
 from ygobench.experiments.probes import extract_probe_samples, run_probes
-from ygobench.experiments.replanning import run_interruption_branch, write_exp6_metrics
+from ygobench.experiments.replanning import (
+    run_offline_counterfactual_audit,
+    write_offline_exp6_metrics,
+)
 from ygobench.experiments.replay import verify_reversible_decisions
 from ygobench.experiments.runner import run_evidence_duel
 
@@ -40,10 +43,17 @@ def build_parser() -> argparse.ArgumentParser:
     probes.add_argument("--extract-only", action="store_true")
     probes.add_argument("--max-state-samples", type=int, default=4)
     probes.add_argument("--max-forecast-samples", type=int, default=4)
+    probes.add_argument(
+        "--forecast-sampling",
+        choices=("chronological", "stratified"),
+        default="stratified",
+        help="Deterministic Exp5 sampling policy (default: stratified by availability).",
+    )
     verify = sub.add_parser("phase4")
     verify.add_argument("--run-id", required=True)
     verify.add_argument("--game-id", required=True)
-    verify.add_argument("--skip-branch", action="store_true")
+    verify.add_argument("--offline-sample-size", type=int, default=10)
+    verify.add_argument("--offline-horizon", type=int, default=32)
     return parser
 
 
@@ -68,7 +78,10 @@ def main() -> int:
         result = compute_phase2_metrics(root / args.run_id)
     elif args.command == "phase3":
         run_dir = root / args.run_id
-        extracted = extract_probe_samples(run_dir)
+        extracted = extract_probe_samples(
+            run_dir,
+            forecast_sampling=args.forecast_sampling,
+        )
         result = {"extracted": extracted}
         if not args.extract_only:
             result["probes"] = run_probes(
@@ -83,13 +96,19 @@ def main() -> int:
             game_dir, output=game_dir / "reversibility_report.json"
         )
         result = {"reversibility": reversible}
-        if reversible["passed"] and not args.skip_branch:
-            result["branch"] = run_interruption_branch(game_dir, root=root)
-        result["metrics"] = write_exp6_metrics(
+        audit = None
+        if reversible["passed"]:
+            audit = run_offline_counterfactual_audit(
+                game_dir,
+                sample_size=args.offline_sample_size,
+                horizon=args.offline_horizon,
+            )
+        result["offline_audit"] = audit
+        result["metrics"] = write_offline_exp6_metrics(
             root / args.run_id,
             game_dir,
             reversibility=reversible,
-            branch=result.get("branch"),
+            audit=audit,
         )
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     return 0

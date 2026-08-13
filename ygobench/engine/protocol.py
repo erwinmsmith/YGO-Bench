@@ -24,6 +24,9 @@ class DecisionRequest:
     observation: dict[str, Any]
     legal_actions: tuple[ActionChoice, ...]
     decision_type: str
+    # True only when ``legal_actions`` is the complete engine-derived action
+    # set, rather than a bounded policy candidate set.
+    legal_actions_complete: bool = False
 
 
 @dataclass(frozen=True)

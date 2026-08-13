@@ -9,12 +9,13 @@ from typing import Any
 from ygobench.engine.full_duel import (
     _add_deck,
     _create_match,
+    _derive_deck_shuffle_seeds,
     _load_upstream,
     _normalize_action,
     _parse_deck,
 )
 from ygobench.engine.visibility import sanitize_events_for_player
-from ygobench.experiments.legal import build_legal_evidence
+from ygobench.experiments.legal import build_legal_evidence, canonical_engine_arguments
 from ygobench.experiments.oracle import build_oracle_state
 
 
@@ -39,8 +40,23 @@ class DuelSession:
         self.engine_seeds = _create_match(
             self.engine, self.core, seed=seed, flags=self.core.DUEL_MODE_MR5
         )
-        _add_deck(self.engine, self.core, player=0, deck=_parse_deck(deck1))
-        _add_deck(self.engine, self.core, player=1, deck=_parse_deck(deck2))
+        self.deck_shuffle_seeds = _derive_deck_shuffle_seeds(seed)
+        self.deck_order_hashes = (
+            _add_deck(
+                self.engine,
+                self.core,
+                player=0,
+                deck=_parse_deck(deck1),
+                shuffle_seed=self.deck_shuffle_seeds[0],
+            ),
+            _add_deck(
+                self.engine,
+                self.core,
+                player=1,
+                deck=_parse_deck(deck2),
+                shuffle_seed=self.deck_shuffle_seeds[1],
+            ),
+        )
         self.engine.start_duel()
         self.step_result = self.duel.advance()
 
@@ -88,7 +104,7 @@ class DuelSession:
         arguments = _normalize_action(action, self.core, self.tools_module)
         bound = inspect.signature(method).bind(**arguments)
         bound.apply_defaults()
-        return action.tool, dict(bound.arguments)
+        return action.tool, canonical_engine_arguments(action.tool, dict(bound.arguments))
 
     def close(self) -> None:
         self.engine.destroy()

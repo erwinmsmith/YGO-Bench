@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import random
 import re
@@ -81,6 +82,28 @@ def _derive_engine_seeds(seed: int) -> tuple[int, int, int, int]:
     return tuple(rng.getrandbits(64) for _ in range(4))  # type: ignore[return-value]
 
 
+def _derive_deck_shuffle_seeds(seed: int) -> tuple[int, int]:
+    """Derive independent, reproducible main-deck shuffle seeds per seat."""
+
+    rng = random.Random(f"ygobench-main-deck-shuffle-v1:{seed}")
+    return rng.getrandbits(64), rng.getrandbits(64)
+
+
+def _shuffled_main(deck: dict[str, list[int]], *, shuffle_seed: int) -> list[int]:
+    """Return a Fisher-Yates shuffled copy without mutating parsed deck data."""
+
+    main = list(deck["main"])
+    random.Random(shuffle_seed).shuffle(main)
+    return main
+
+
+def _deck_order_hash(main: list[int]) -> str:
+    """Commit to a hidden shuffled deck order without exposing it publicly."""
+
+    payload = ",".join(str(code) for code in main).encode()
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _create_match(engine, core, *, seed: int, flags: int) -> tuple[int, int, int, int]:
     engine_seeds = _derive_engine_seeds(seed)
     options = core.OCG_DuelOptions()
@@ -109,8 +132,26 @@ def _create_match(engine, core, *, seed: int, flags: int) -> tuple[int, int, int
     return engine_seeds
 
 
-def _add_deck(engine, core, *, player: int, deck: dict[str, list[int]]) -> None:
-    for code in deck["main"]:
+def _add_deck(
+    engine,
+    core,
+    *,
+    player: int,
+    deck: dict[str, list[int]],
+    shuffle_seed: int | None = None,
+) -> str:
+    """Load one deck and return the committed main-deck order hash.
+
+    OCGCore does not shuffle a deck merely because cards are added at startup;
+    without this explicit shuffle, opening hands are the tail of the .ydk file.
+    """
+
+    main = (
+        _shuffled_main(deck, shuffle_seed=shuffle_seed)
+        if shuffle_seed is not None
+        else list(deck["main"])
+    )
+    for code in main:
         card = core.OCG_NewCardInfo(
             team=player,
             duelist=0,
@@ -132,6 +173,7 @@ def _add_deck(engine, core, *, player: int, deck: dict[str, list[int]]) -> None:
             pos=core.POS_FACEDOWN_DEFENSE,
         )
         engine.lib.OCG_DuelNewCard(engine.duel, ctypes.byref(card))
+    return _deck_order_hash(main)
 
 
 def _safe_name(value: str) -> str:
@@ -217,8 +259,11 @@ def run_duel(
         deck1 = _parse_deck(deck1_path)
         deck2 = _parse_deck(deck2_path)
         _create_match(engine, core, seed=seed, flags=core.DUEL_MODE_MR5)
-        _add_deck(engine, core, player=0, deck=deck1)
-        _add_deck(engine, core, player=1, deck=deck2)
+        shuffle_seeds = _derive_deck_shuffle_seeds(seed)
+        deck_order_hashes = (
+            _add_deck(engine, core, player=0, deck=deck1, shuffle_seed=shuffle_seeds[0]),
+            _add_deck(engine, core, player=1, deck=deck2, shuffle_seed=shuffle_seeds[1]),
+        )
         log(
             {
                 "type": "config",
@@ -235,6 +280,12 @@ def run_duel(
                 "starting_hand": 5,
                 "draw_per_turn": 1,
                 "prompt_template": "full_duel_system.md@v1",
+                "randomization": {
+                    "engine_seeds": list(_derive_engine_seeds(seed)),
+                    "deck_shuffle_seeds": list(shuffle_seeds),
+                    "deck_order_hashes": list(deck_order_hashes),
+                    "algorithm": "python_random_fisher_yates_v1",
+                },
             }
         )
         engine.start_duel()

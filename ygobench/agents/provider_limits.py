@@ -46,3 +46,26 @@ def omit_deepseek_token_limit(provider: Any) -> Any:
     provider.max_tokens = None
     provider._ygobench_uncapped = True
     return provider
+
+
+def force_single_tool_call(provider: Any) -> Any:
+    """Inject the OpenAI-compatible flag that disables parallel tool calls.
+
+    This wrapper deliberately lives in YGO-Bench rather than modifying the
+    vendored provider submodule, so experiment provenance remains reproducible
+    from this repository alone.
+    """
+
+    if getattr(provider, "_ygobench_single_tool_call", False):
+        return provider
+    completions = provider._client.chat.completions
+    create = completions.create
+
+    @wraps(create)
+    def create_with_single_tool_call(*args: Any, **kwargs: Any) -> Any:
+        kwargs["parallel_tool_calls"] = False
+        return create(*args, **kwargs)
+
+    completions.create = create_with_single_tool_call
+    provider._ygobench_single_tool_call = True
+    return provider

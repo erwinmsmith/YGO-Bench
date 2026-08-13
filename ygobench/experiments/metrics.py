@@ -33,11 +33,16 @@ def compute_phase2_metrics(run_dir: Path) -> dict[str, Any]:
         decisions.extend(JsonlJournal(game_dir / "trajectory.jsonl").recover())
 
     agents = sorted({agent for outcome in outcomes for agent in outcome.get("agents", [])})
+    competitive_outcomes = [
+        outcome
+        for outcome in outcomes
+        if outcome.get("competitive_eligible", outcome.get("termination") == "game_over")
+    ]
     exp1_rows = []
     for agent in agents:
         seat_games = [
             (outcome, seat)
-            for outcome in outcomes
+            for outcome in competitive_outcomes
             for seat, seat_agent in enumerate(outcome["agents"])
             if seat_agent == agent
         ]
@@ -49,6 +54,15 @@ def compute_phase2_metrics(run_dir: Path) -> dict[str, Any]:
                     "win_rate", wins, len(seat_games), direction="higher_is_better"
                 ),
                 "seat_games": len(seat_games),
+                "excluded_non_engine_terminal_games": sum(
+                    1
+                    for outcome in outcomes
+                    for seat_agent in outcome["agents"]
+                    if seat_agent == agent
+                    and not outcome.get(
+                        "competitive_eligible", outcome.get("termination") == "game_over"
+                    )
+                ),
                 "engine_completion_rate": sum(
                     outcome.get("game_over", False) for outcome, _ in seat_games
                 )
@@ -63,7 +77,21 @@ def compute_phase2_metrics(run_dir: Path) -> dict[str, Any]:
                 ),
             }
         )
-    exp1 = {"experiment": 1, "games": len(outcomes), "leaderboard": exp1_rows}
+    exp1 = {
+        "experiment": 1,
+        "games_observed": len(outcomes),
+        "games_eligible_for_win_rate": len(competitive_outcomes),
+        "excluded_by_termination": dict(
+            Counter(
+                outcome.get("termination", "missing_outcome")
+                for outcome in outcomes
+                if not outcome.get(
+                    "competitive_eligible", outcome.get("termination") == "game_over"
+                )
+            )
+        ),
+        "leaderboard": exp1_rows,
+    }
 
     taxonomy: dict[str, Counter[str]] = defaultdict(Counter)
     responder: dict[str, Counter[str]] = defaultdict(Counter)

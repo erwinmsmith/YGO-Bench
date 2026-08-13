@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from copy import deepcopy
 from pathlib import Path
 from typing import Any
 
 from ygobench.agents.base import BaseAgent
 from ygobench.agents.provider_limits import (
+    force_single_tool_call,
     omit_deepseek_token_limit,
     scrub_reasoning_content,
 )
@@ -19,6 +21,8 @@ from ygobench.engine.upstream import UpstreamLayout
 from ygobench.engine.visibility import sanitize_events_for_player
 
 PROMPT_ROOT = Path(__file__).parent / "prompts"
+MAX_PROVIDER_CONNECTION_RETRIES = 3
+CONNECTION_RETRY_DELAYS_SECONDS = (10.0, 10.0, 10.0)
 
 
 def _provider_runtime():
@@ -111,6 +115,87 @@ def compact_prompt_state(state: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def exact_legal_actions_packet(decision: DecisionRequest) -> str:
+    """Render an authoritative, copyable action list for exact decisions."""
+
+    actions = [
+        {"name": action.tool, "arguments": action.arguments}
+        for action in decision.legal_actions
+    ]
+    return (
+        "\n\n## Authoritative exact legal actions\n"
+        "The list below is complete for this engine decision. Choose exactly one "
+        "entry and reproduce its tool name and arguments verbatim, including "
+        "argument keys and index order. Do not construct a new argument object.\n\n"
+        "```json\n"
+        + json.dumps(actions, ensure_ascii=False, indent=2, default=str)
+        + "\n```"
+    )
+
+
+class ProviderProtocolError(RuntimeError):
+    """Raised locally when a tool-call transcript is not API-valid."""
+
+    def __init__(self, diagnostics: dict[str, Any]) -> None:
+        self.diagnostics = diagnostics
+        super().__init__("invalid_tool_message_transcript: " + json.dumps(diagnostics, sort_keys=True))
+
+
+class ProviderConnectionError(RuntimeError):
+    """A transient provider failure after all bounded retries are exhausted."""
+
+    provider_failure_type = "connection"
+
+    def __init__(self, cause: Exception, attempts: list[dict[str, Any]]) -> None:
+        self.attempts = attempts
+        self.cause_type = type(cause).__name__
+        super().__init__(f"{self.cause_type}: provider connection retries exhausted")
+
+
+def _tool_protocol_diagnostics(messages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Audit assistant tool calls and their immediately following results."""
+
+    pending: list[str] = []
+    malformed: list[str] = []
+    tool_call_ids: list[str] = []
+    tool_result_ids: list[str] = []
+    tool_names: list[str] = []
+    for message in messages:
+        role = message.get("role")
+        if role == "assistant":
+            if pending:
+                malformed.append("assistant_before_all_tool_results")
+            calls = message.get("tool_calls") or []
+            ids = [str(call.get("id", "")) for call in calls]
+            tool_call_ids.extend(ids)
+            tool_names.extend(str(call.get("name", "")) for call in calls)
+            if len(ids) != len(set(ids)) or any(not value for value in ids):
+                malformed.append("missing_or_duplicate_tool_call_id")
+            pending.extend(ids)
+        elif role == "tool":
+            call_id = str(message.get("tool_call_id", ""))
+            tool_result_ids.append(call_id)
+            if call_id not in pending:
+                malformed.append("orphan_or_duplicate_tool_result")
+            else:
+                pending.remove(call_id)
+        elif pending:
+            malformed.append("non_tool_message_before_all_tool_results")
+    return {
+        "assistant_tool_call_count": len(tool_call_ids),
+        "tool_result_count": len(tool_result_ids),
+        "tool_names": tool_names,
+        "tool_call_ids": tool_call_ids,
+        "tool_result_ids": tool_result_ids,
+        "unresolved_tool_call_ids": len(pending),
+        "protocol_errors": sorted(set(malformed)),
+    }
+
+
+def _is_connection_error(exc: Exception) -> bool:
+    return type(exc).__name__ in {"APIConnectionError", "APITimeoutError"}
+
+
 class LLMFullDuelAgent(BaseAgent):
     """Select exactly one ocgcore response tool for each pending decision."""
 
@@ -134,12 +219,14 @@ class LLMFullDuelAgent(BaseAgent):
         self._provider = get_provider(model.provider, model.model, **kwargs)
         if model.provider == "deepseek" and max_tokens is None:
             omit_deepseek_token_limit(self._provider)
+        force_single_tool_call(self._provider)
         if model.provider == "deepseek" and not thinking_enabled:
             self._provider.reasoning_effort = None
             self._provider.thinking_enabled = False
         self._tool_defs = {tool["name"]: tool for tool in tools_module.TOOLS}
         self._max_inspections = max_inspections
         self._max_forced_retries = max_forced_retries
+        self._max_provider_connection_retries = MAX_PROVIDER_CONNECTION_RETRIES
         self._system_prompt = (PROMPT_ROOT / "full_duel_system.md").read_text()
         self._observation_template = (PROMPT_ROOT / "full_duel_observation.md").read_text()
         self.name = f"{profile}:{model.provider}:{model.model}"
@@ -161,6 +248,52 @@ class LLMFullDuelAgent(BaseAgent):
             if isinstance(value, (int, float)):
                 self.usage[key] = self.usage.get(key, 0.0) + float(value)
         self.usage["wallclock_seconds"] = self.usage.get("wallclock_seconds", 0.0) + elapsed
+
+    def _respond_once(
+        self,
+        *,
+        system: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        requests: list[dict[str, Any]],
+        transport_attempts: list[dict[str, Any]],
+    ) -> Any:
+        """Validate the transcript then retry only transient transport errors."""
+
+        diagnostics = _tool_protocol_diagnostics(messages)
+        if diagnostics["unresolved_tool_call_ids"] or diagnostics["protocol_errors"]:
+            raise ProviderProtocolError(diagnostics)
+        requests.append(
+            scrub_reasoning_content(
+                {"system": system, "messages": deepcopy(messages), "tools": deepcopy(tools)}
+            )
+        )
+        max_connection_retries = getattr(
+            self, "_max_provider_connection_retries", MAX_PROVIDER_CONNECTION_RETRIES
+        )
+        for attempt in range(max_connection_retries + 1):
+            try:
+                turn = self._provider.respond(system=system, messages=messages, tools=tools)
+                self._accumulate(turn.usage, turn.wallclock_seconds)
+                transport_attempts.append(
+                    {"attempt": attempt + 1, "outcome": "success", "error_type": None}
+                )
+                return turn
+            except Exception as exc:  # noqa: BLE001
+                retryable = _is_connection_error(exc)
+                transport_attempts.append(
+                    {
+                        "attempt": attempt + 1,
+                        "outcome": "error",
+                        "error_type": type(exc).__name__,
+                        "retryable": retryable,
+                    }
+                )
+                if not retryable:
+                    raise
+                if attempt >= max_connection_retries:
+                    raise ProviderConnectionError(exc, transport_attempts) from exc
+                time.sleep(CONNECTION_RETRY_DELAYS_SECONDS[attempt])
 
     def predict(self, decision: DecisionRequest) -> ActionChoice:
         if len(decision.legal_actions) == 1:
@@ -186,6 +319,8 @@ class LLMFullDuelAgent(BaseAgent):
         prompt = self._observation_template.replace(
             "{{STATE_JSON}}", json.dumps(state, ensure_ascii=False, indent=2, default=str)
         ).replace("{{REQUIRED_RESPONDER}}", responder)
+        if decision.legal_actions_complete:
+            prompt += exact_legal_actions_packet(decision)
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
         available_tools = [self._tool_defs["inspect_card"], response_tool]
         active_system_prompt = self._system_prompt
@@ -193,23 +328,16 @@ class LLMFullDuelAgent(BaseAgent):
         forced_retries = 0
         traces: list[dict[str, Any]] = []
         requests: list[dict[str, Any]] = []
+        transport_attempts: list[dict[str, Any]] = []
 
         while inspections <= self._max_inspections:
-            requests.append(
-                scrub_reasoning_content(
-                    {
-                    "system": active_system_prompt,
-                    "messages": deepcopy(messages),
-                    "tools": deepcopy(available_tools),
-                    }
-                )
-            )
-            turn = self._provider.respond(
+            turn = self._respond_once(
                 system=active_system_prompt,
                 messages=messages,
                 tools=available_tools,
+                requests=requests,
+                transport_attempts=transport_attempts,
             )
-            self._accumulate(turn.usage, turn.wallclock_seconds)
             trace = {
                 "text": turn.text,
                 "tool_calls": [
@@ -224,9 +352,26 @@ class LLMFullDuelAgent(BaseAgent):
                 "provider_data": scrub_reasoning_content(turn.provider_data),
             }
             traces.append(trace)
+            if len(turn.tool_calls) > 1:
+                raise ProviderProtocolError(
+                    {
+                        "protocol_errors": ["multiple_tool_calls_in_single_model_turn"],
+                        "assistant_tool_call_count": len(turn.tool_calls),
+                        "tool_result_count": 0,
+                        "tool_names": [call.name for call in turn.tool_calls],
+                        "tool_call_ids": [call.id for call in turn.tool_calls],
+                        "tool_result_ids": [],
+                        "unresolved_tool_call_ids": len(turn.tool_calls),
+                    }
+                )
             action_call = next((call for call in turn.tool_calls if call.name == responder), None)
             if action_call is not None:
-                self.last_trace = {"requests": requests, "turns": traces, "fallback": False}
+                self.last_trace = {
+                    "requests": requests,
+                    "turns": traces,
+                    "transport_attempts": transport_attempts,
+                    "fallback": False,
+                }
                 return ActionChoice(
                     tool=action_call.name,
                     arguments=action_call.arguments,
@@ -243,24 +388,18 @@ class LLMFullDuelAgent(BaseAgent):
                         "provider_data": turn.provider_data,
                     }
                 )
-                for inspect_call in inspect_calls:
-                    if inspections < self._max_inspections:
-                        card_code = int(inspect_call.arguments.get("card_code", 0))
-                        card_info = _find_card(decision.observation, card_code)
-                        inspections += 1
-                    else:
-                        card_info = {
-                            "name": None,
-                            "note": "Per-decision card inspection budget exhausted.",
-                        }
-                    messages.append(
-                        {
-                            "role": "tool",
-                            "tool_call_id": inspect_call.id,
-                            "content": json.dumps(card_info, ensure_ascii=False, default=str),
-                            "is_error": card_info.get("name") is None,
-                        }
-                    )
+                inspect_call = inspect_calls[0]
+                card_code = int(inspect_call.arguments.get("card_code", 0))
+                card_info = _find_card(decision.observation, card_code)
+                inspections += 1
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": inspect_call.id,
+                        "content": json.dumps(card_info, ensure_ascii=False, default=str),
+                        "is_error": card_info.get("name") is None,
+                    }
+                )
                 if inspections >= self._max_inspections:
                     available_tools = [response_tool]
                 continue
@@ -303,10 +442,63 @@ class LLMFullDuelAgent(BaseAgent):
         self.last_trace = {
             "requests": requests,
             "turns": traces,
+            "transport_attempts": transport_attempts,
             "fallback": True,
             "error": "model did not call required responder",
         }
         return decision.legal_actions[0]
+
+    def correct_invalid_action(self, decision: DecisionRequest) -> tuple[ActionChoice | None, dict[str, Any]]:
+        """Request one replacement from the authoritative legal action list.
+
+        This is deliberately a narrow correction call: it cannot inspect cards
+        or select a different responder, and is used only after an attempted
+        action has failed the pre-engine exact-legal gate.
+        """
+
+        responder = decision.decision_type
+        response_tool = self._tool_defs.get(responder)
+        if response_tool is None:
+            return None, {"error": f"No tool schema for responder {responder}"}
+        packet = {
+            "required_responder": responder,
+            "legal_responses": [
+                {"name": action.tool, "arguments": action.arguments}
+                for action in decision.legal_actions
+            ],
+        }
+        requests: list[dict[str, Any]] = []
+        transport_attempts: list[dict[str, Any]] = []
+        turn = self._respond_once(
+            system=(
+                "Return exactly one tool call. The legal_responses list is authoritative; "
+                "choose one entry verbatim and do not provide prose."
+            ),
+            messages=[
+                {
+                    "role": "user",
+                    "content": json.dumps(packet, ensure_ascii=False, default=str),
+                }
+            ],
+            tools=[response_tool],
+            requests=requests,
+            transport_attempts=transport_attempts,
+        )
+        trace = {
+            "tool_calls": [
+                {"id": call.id, "name": call.name, "arguments": call.arguments}
+                for call in turn.tool_calls
+            ],
+            "stop_reason": turn.stop_reason,
+            "usage": turn.usage,
+            "elapsed_seconds": turn.wallclock_seconds,
+            "provider_data": scrub_reasoning_content(turn.provider_data),
+            "transport_attempts": transport_attempts,
+        }
+        call = next((item for item in turn.tool_calls if item.name == responder), None)
+        if call is None:
+            return None, trace
+        return ActionChoice(tool=call.name, arguments=call.arguments, label=call.name), trace
 
 
 def _find_visible_card(value: Any, code: int) -> dict[str, Any] | None:

@@ -74,6 +74,19 @@ class TaskRegistry:
             )
             return updated.rowcount == 1
 
+    def renew(self, task_id: str, lease_minutes: int = 30) -> bool:
+        """Extend an owned running lease after durable progress is recorded."""
+
+        now = datetime.now(UTC)
+        lease = (now + timedelta(minutes=lease_minutes)).isoformat()
+        with self.connect() as db:
+            updated = db.execute(
+                """UPDATE tasks SET lease_until=?, updated_at=?
+                   WHERE task_id=? AND status='RUNNING'""",
+                (lease, now.isoformat(), task_id),
+            )
+            return updated.rowcount == 1
+
     def finish(self, task_id: str, *, error: str | None = None) -> None:
         status = "FAILED_RETRYABLE" if error else "COMPLETED"
         with self.connect() as db:

@@ -27,10 +27,32 @@ EXACT_RESPONDERS = {
 }
 
 
+def canonical_engine_arguments(tool: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Normalize only argument order that ocgcore treats as a set.
+
+    ``MSG_SELECT_CARD`` and ``MSG_SELECT_TRIBUTE`` identify chosen cards by
+    index, not by the order in which those indices are supplied. Canonicalize
+    that representation before exact-legal comparison so equivalent choices
+    such as ``[3, 0]`` and ``[0, 3]`` are not logged as model errors.
+    """
+
+    normalized = dict(arguments)
+    if tool in {"select_card", "select_tribute"} and isinstance(
+        normalized.get("indices"), list
+    ):
+        normalized["indices"] = sorted(normalized["indices"])
+    return normalized
+
+
 def _action_signature(action: Any) -> tuple[str, str]:
     return (
         action.tool,
-        json.dumps(action.arguments, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+        json.dumps(
+            canonical_engine_arguments(action.tool, action.arguments),
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
     )
 
 
@@ -87,6 +109,8 @@ def build_legal_evidence(
         size = len(decision.get("places", []))
         count = int(decision.get("count", 1))
         complete = _combination_count(size, count, count) <= 64
+    elif responder in {"select_sum", "select_tribute", "announce_card"}:
+        complete = False
     return actions, {
         "expected_responder": responder,
         "legal_action_count": len(actions),

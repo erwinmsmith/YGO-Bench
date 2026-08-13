@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal, TypeVar
 
 from ygobench.agents.llm_agent import compact_prompt_state
 from ygobench.agents.provider_limits import omit_deepseek_token_limit
@@ -14,6 +14,8 @@ from ygobench.experiments.io import JsonlJournal, content_hash
 
 _COMMITMENT_COMMANDS = {"activate", "summon", "sp_summon", "attack"}
 _NEW_DECISION_BOUNDARIES = {"select_idlecmd", "select_battlecmd", "rock_paper_scissors"}
+ForecastSampling = Literal["chronological", "stratified"]
+T = TypeVar("T")
 
 
 def _provider(model: str):
@@ -99,7 +101,76 @@ def _response_window_after(
     return None
 
 
-def extract_probe_samples(run_dir: Path, *, max_forecasts_per_game: int = 8) -> dict[str, int]:
+def _evenly_spaced(items: list[T], count: int) -> list[T]:
+    """Select a deterministic trajectory-spanning subset without replacement."""
+    if count <= 0 or not items:
+        return []
+    if count >= len(items):
+        return list(items)
+    if count == 1:
+        return [items[len(items) // 2]]
+    return [
+        items[round(index * (len(items) - 1) / (count - 1))]
+        for index in range(count)
+    ]
+
+
+def _select_forecast_candidates(
+    candidates: list[dict[str, Any]], *, max_samples: int, sampling: ForecastSampling
+) -> list[dict[str, Any]]:
+    """Select forecast probes deterministically, preserving label coverage when possible.
+
+    Availability is Exp5's primary target.  Stratifying on it guarantees that a
+    run with both classes contributes both interruption and silent windows.  If
+    a completed duel naturally contains only one class, the fallback remains a
+    trajectory-spanning sample from that class; it never fabricates positives.
+    """
+    if sampling == "chronological":
+        return candidates[:max_samples]
+    if sampling != "stratified":
+        raise ValueError(f"Unsupported forecast sampling policy: {sampling}")
+
+    groups = {
+        label: [
+            candidate
+            for candidate in candidates
+            if candidate["availability_ground_truth"] == label
+        ]
+        for label in (0, 1)
+    }
+    present = [label for label in (1, 0) if groups[label]]
+    if not present or max_samples <= 0:
+        return []
+
+    quota, remainder = divmod(max_samples, len(present))
+    selected: list[dict[str, Any]] = []
+    for position, label in enumerate(present):
+        selected.extend(
+            _evenly_spaced(groups[label], quota + int(position < remainder))
+        )
+
+    # If a small class cannot use its quota, fill from the remaining candidates
+    # while retaining deterministic, whole-trajectory coverage.
+    selected_ids = {candidate["sample_id"] for candidate in selected}
+    if len(selected) < min(max_samples, len(candidates)):
+        remainder_pool = [
+            candidate for candidate in candidates if candidate["sample_id"] not in selected_ids
+        ]
+        selected.extend(
+            _evenly_spaced(
+                remainder_pool,
+                min(max_samples, len(candidates)) - len(selected),
+            )
+        )
+    return sorted(selected, key=lambda candidate: candidate["trajectory_index"])
+
+
+def extract_probe_samples(
+    run_dir: Path,
+    *,
+    max_forecasts_per_game: int = 8,
+    forecast_sampling: ForecastSampling = "stratified",
+) -> dict[str, int]:
     state_out = JsonlJournal(run_dir / "derived" / "state_probe_samples.jsonl")
     forecast_out = JsonlJournal(run_dir / "derived" / "forecast_samples.jsonl")
     state_out.rewrite([])
@@ -152,7 +223,7 @@ def extract_probe_samples(run_dir: Path, *, max_forecasts_per_game: int = 8) -> 
             )
             state_count += 1
 
-        candidates = 0
+        forecast_candidates: list[dict[str, Any]] = []
         for index, row in enumerate(public):
             if not row.get("validation", {}).get("valid", False):
                 continue
@@ -161,7 +232,7 @@ def extract_probe_samples(run_dir: Path, *, max_forecasts_per_game: int = 8) -> 
                 continue
             command = action.get("arguments", {}).get("command")
             commitment = command in _COMMITMENT_COMMANDS
-            if not commitment or candidates >= max_forecasts_per_game:
+            if not commitment:
                 continue
             window = _response_window_after(public, index)
             if window is None:
@@ -178,11 +249,12 @@ def extract_probe_samples(run_dir: Path, *, max_forecasts_per_game: int = 8) -> 
                 and actual_response.get("arguments", {}).get("index") is not None
                 and response_row.get("validation", {}).get("valid", False)
             )
-            forecast_out.append(
+            forecast_candidates.append(
                 {
                     "sample_id": f"{row['game_id']}:{row['decision_id']}:forecast",
                     "game_id": row["game_id"],
                     "decision_id": row["decision_id"],
+                    "trajectory_index": index,
                     "observation": compact_prompt_state(row["observation"]),
                     "commitment_action": action,
                     "response_window_id": response_row["decision_id"],
@@ -193,8 +265,25 @@ def extract_probe_samples(run_dir: Path, *, max_forecasts_per_game: int = 8) -> 
                     "behavior_ground_truth": int(behavior),
                 }
             )
+
+        selected_forecasts = _select_forecast_candidates(
+            forecast_candidates,
+            max_samples=max_forecasts_per_game,
+            sampling=forecast_sampling,
+        )
+        for sample in selected_forecasts:
+            sample["forecast_sampling"] = forecast_sampling
+            sample["candidate_class_counts"] = {
+                "availability_positive": sum(
+                    candidate["availability_ground_truth"] for candidate in forecast_candidates
+                ),
+                "availability_negative": sum(
+                    not candidate["availability_ground_truth"]
+                    for candidate in forecast_candidates
+                ),
+            }
+            forecast_out.append(sample)
             forecast_count += 1
-            candidates += 1
     return {"state_samples": state_count, "forecast_samples": forecast_count}
 
 

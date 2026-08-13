@@ -12,7 +12,7 @@ from typing import Any
 
 from ygobench.agents.factory import create_agent
 from ygobench.config import PROJECT_ROOT
-from ygobench.engine.full_duel import _passive_fallback
+from ygobench.engine.full_duel import _derive_deck_shuffle_seeds, _passive_fallback
 from ygobench.engine.protocol import ActionChoice, DecisionRequest
 from ygobench.experiments.config import ExperimentConfig, stable_id
 from ygobench.experiments.io import (
@@ -124,6 +124,12 @@ def _manifest(config: ExperimentConfig, game_dir: Path) -> dict[str, Any]:
         },
         "checkpoint_mode": "deterministic_action_prefix_replay",
         "native_engine_serialization": False,
+        "randomization": {
+            "engine_seed": config.seed,
+            "deck_shuffle_seeds": list(_derive_deck_shuffle_seeds(config.seed)),
+            "deck_shuffle_algorithm": "python_random_fisher_yates_v1",
+            "llm_sampling": "provider_non_deterministic_unless_provider_seed_is_supported",
+        },
     }
 
 
@@ -227,6 +233,7 @@ def run_evidence_duel(
                 observation=view["observation"],
                 legal_actions=view["actions"],
                 decision_type=expected,
+                legal_actions_complete=bool(view["legal"]["enumeration_complete"]),
             )
             agent = agents[player]
             attempted: ActionChoice | None = None
@@ -238,23 +245,51 @@ def run_evidence_duel(
             except Exception as exc:  # noqa: BLE001
                 agent_error = f"{type(exc).__name__}: {exc}"
                 executed = _passive_fallback(session.duel.pending, session.replay_module)
-                trace = {"fallback": True, "exception": agent_error}
+                error_type = type(exc).__name__
+                failure_type = getattr(exc, "provider_failure_type", None)
+                if failure_type == "connection" or error_type in {
+                    "APIConnectionError",
+                    "APITimeoutError",
+                }:
+                    fallback_reason = "deterministic_fallback_after_provider_connection_error"
+                elif error_type == "ProviderProtocolError":
+                    fallback_reason = "deterministic_fallback_after_provider_protocol_error"
+                else:
+                    fallback_reason = "deterministic_fallback_after_provider_error"
+                previous_trace = getattr(agent, "last_trace", {})
+                trace = {
+                    **(previous_trace if isinstance(previous_trace, dict) else {}),
+                    "fallback": True,
+                    "exception": agent_error,
+                    "provider_failure_type": error_type,
+                }
+                if error_type == "ProviderProtocolError":
+                    trace["provider_protocol_diagnostics"] = getattr(exc, "diagnostics", None)
+                if failure_type == "connection":
+                    trace["provider_transport_attempts"] = getattr(exc, "attempts", [])
             else:
                 executed = attempted
                 if attempted.tool != expected:
                     agent_error = f"wrong_responder: expected {expected}, got {attempted.tool}"
                     executed = _passive_fallback(session.duel.pending, session.replay_module)
+                    fallback_reason = "deterministic_fallback_wrong_responder"
+                else:
+                    fallback_reason = "none"
                 trace = (
                     getattr(agent, "last_trace", {})
                     if decision_index not in interventions
                     else {"intervention": True}
                 )
+            attempted_invalid = agent_error is not None
+            recovery = fallback_reason if agent_error else "none"
             elapsed = time.perf_counter() - call_started
             diagnostics = _trace_diagnostics(trace, expected)
 
             exact_legal_check_performed = bool(view["legal"]["enumeration_complete"])
+            validation_scope = "exact" if exact_legal_check_performed else "engine_only"
             pre_engine_error: str | None = None
             engine_error: str | None = None
+            correction_trace: dict[str, Any] | None = None
             exact_legal_match = True
             if exact_legal_check_performed:
                 try:
@@ -275,17 +310,37 @@ def run_evidence_duel(
                         "action_not_in_exact_legal_set: "
                         f"{executed.tool} {executed.arguments!r}"
                     )
-                forfeit_winner = 1 - player
-                termination = "illegal_action_forfeit"
-                step = None
+                attempted_invalid = True
+                corrected: ActionChoice | None = None
+                if decision_index not in interventions and hasattr(agent, "correct_invalid_action"):
+                    try:
+                        corrected, correction_trace = agent.correct_invalid_action(request)
+                    except Exception as exc:  # noqa: BLE001
+                        correction_trace = {"exception": f"{type(exc).__name__}: {exc}"}
+                if corrected is not None and exact_legal_action_match(
+                    corrected, view["actions"], signature=session.action_signature
+                ):
+                    executed = corrected
+                    recovery = "corrected_retry"
+                else:
+                    executed = _passive_fallback(session.duel.pending, session.replay_module)
+                    recovery = "deterministic_fallback"
+                step = session.execute(executed)
             else:
                 try:
                     step = session.execute(executed)
                 except Exception as exc:  # noqa: BLE001
                     engine_error = f"{type(exc).__name__}: {exc}"
-                    forfeit_winner = 1 - player
-                    termination = "illegal_action_forfeit"
-                    step = None
+                    attempted_invalid = True
+                    executed = _passive_fallback(session.duel.pending, session.replay_module)
+                    recovery = "deterministic_fallback_after_engine_error"
+                    try:
+                        step = session.execute(executed)
+                        engine_error = None
+                    except Exception as fallback_exc:  # noqa: BLE001
+                        engine_error = f"fallback_failed: {type(fallback_exc).__name__}: {fallback_exc}"
+                        termination = "engine_rejection_abort"
+                        step = None
             after = build_oracle_state(session)
             decision_id = f"d{decision_index + 1:06d}"
             action_id = stable_id("action", [config.game_id, decision_id])
@@ -314,18 +369,25 @@ def run_evidence_duel(
                 "executed_action": asdict(executed),
                 "action_summary": action_summary,
                 "validation": {
-                    "valid": agent_error is None
-                    and pre_engine_error is None
-                    and engine_error is None
-                    and not diagnostics["protocol_errors"],
+                    "valid": (
+                        agent_error is None
+                        and not attempted_invalid
+                        and engine_error is None
+                        and not diagnostics["protocol_errors"]
+                    ),
                     "agent_error": agent_error,
                     "pre_engine_error": pre_engine_error,
+                    "attempted_invalid": attempted_invalid,
+                    "recovery": recovery,
+                    "validation_scope": validation_scope,
                     "exact_legal_check_performed": exact_legal_check_performed,
                     "engine_submission_attempted": pre_engine_error is None,
+                    "recovery_engine_submission_attempted": step is not None,
                     "engine_error": engine_error,
                     **diagnostics,
                 },
                 "trace": trace,
+                "correction_trace": correction_trace,
                 "engine_events": step.events if step is not None else [],
                 "elapsed_seconds": round(elapsed, 6),
                 "oracle_before_hash": before["state_hash"],
@@ -364,8 +426,10 @@ def run_evidence_duel(
                 game_dir / "status.json",
                 {"status": "RUNNING", "committed_decisions": decision_index},
             )
+            registry.renew(config.game_id)
             if pre_engine_error or engine_error:
-                break
+                if engine_error:
+                    break
 
         if forfeit_winner is None:
             if session.duel.state.game_over:
@@ -375,6 +439,9 @@ def run_evidence_duel(
         winner = forfeit_winner if forfeit_winner is not None else session.duel.state.winner
         game_over = bool(session.duel.state.game_over or forfeit_winner is not None)
         final_rows = public.recover()
+        recovered_invalid_action = any(
+            bool(row.get("validation", {}).get("attempted_invalid")) for row in final_rows
+        )
         final_totals = _record_totals(final_rows)
         full_decisions_by_player = [
             int(final_totals["decisions"][seat])
@@ -392,10 +459,19 @@ def run_evidence_duel(
             "game_id": config.game_id,
             "termination": termination,
             "game_over": game_over,
+            "competitive_eligible": bool(
+                termination == "game_over" and not recovered_invalid_action
+            ),
+            "recovered_invalid_action": recovered_invalid_action,
             "winner": winner,
             "agents": [config.agent1, config.agent2],
             "decks": [config.deck1, config.deck2],
             "seed": config.seed,
+            "randomization": {
+                "engine_seeds": list(session.engine_seeds),
+                "deck_shuffle_seeds": list(session.deck_shuffle_seeds),
+                "deck_order_hashes": list(session.deck_order_hashes),
+            },
             "turn_count": session.duel.state.turn_count,
             "decisions": decision_index,
             "decisions_by_player": full_decisions_by_player,
