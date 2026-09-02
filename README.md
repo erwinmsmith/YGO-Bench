@@ -274,4 +274,4 @@ ocgcore/CardScripts/BabelCDB commits, dataset versions, and run configuration.
 - Banlists: [ProjectIgnis/LFLists](https://github.com/ProjectIgnis/LFLists)
 
 Card art is cached on demand by the backend from the YGOPRODeck image service;
-the repository does not bulk-commit card images.
+the repository does not bulk-commit card images. Contact me at openex@code-soul.cocm
