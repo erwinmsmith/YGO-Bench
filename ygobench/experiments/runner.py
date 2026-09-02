@@ -26,6 +26,8 @@ from ygobench.experiments.oracle import build_oracle_state
 from ygobench.experiments.registry import TaskRegistry
 from ygobench.experiments.session import DuelSession
 
+MAX_MODEL_ACTION_ATTEMPTS = 3
+
 
 def _file_hash(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -75,6 +77,12 @@ def _trace_diagnostics(trace: dict[str, Any], expected: str) -> dict[str, Any]:
         errors.append("missing_tool_call")
     if any(count > 1 for count in response_counts):
         errors.append("multiple_response_calls")
+    for diagnostic in (
+        trace.get("provider_protocol_diagnostics"),
+        trace.get("error"),
+    ):
+        if isinstance(diagnostic, dict):
+            errors.extend(str(value) for value in diagnostic.get("protocol_errors", []))
     return {
         "automatic": bool(trace.get("automatic")),
         "retry_count": max(0, len(turns) - 1),
@@ -237,51 +245,54 @@ def run_evidence_duel(
             )
             agent = agents[player]
             attempted: ActionChoice | None = None
-            executed: ActionChoice
+            executed: ActionChoice | None = None
             agent_error: str | None = None
+            terminal_model_failure = False
+            model_action_attempts = 0
             call_started = time.perf_counter()
             try:
+                model_action_attempts = 1
                 attempted = interventions.get(decision_index) or agent.predict(request)
             except Exception as exc:  # noqa: BLE001
                 agent_error = f"{type(exc).__name__}: {exc}"
-                executed = _passive_fallback(session.duel.pending, session.replay_module)
                 error_type = type(exc).__name__
-                failure_type = getattr(exc, "provider_failure_type", None)
-                if failure_type == "connection" or error_type in {
-                    "APIConnectionError",
-                    "APITimeoutError",
-                }:
-                    fallback_reason = "deterministic_fallback_after_provider_connection_error"
-                elif error_type == "ProviderProtocolError":
-                    fallback_reason = "deterministic_fallback_after_provider_protocol_error"
-                else:
-                    fallback_reason = "deterministic_fallback_after_provider_error"
                 previous_trace = getattr(agent, "last_trace", {})
+                if isinstance(previous_trace, dict):
+                    provider_diagnostics = getattr(exc, "diagnostics", None)
+                    model_action_attempts = max(
+                        model_action_attempts,
+                        int(
+                            provider_diagnostics.get("model_action_attempts", 0)
+                            if isinstance(provider_diagnostics, dict)
+                            else 0
+                        ),
+                        len(previous_trace.get("transport_attempts", [])),
+                    )
                 trace = {
                     **(previous_trace if isinstance(previous_trace, dict) else {}),
-                    "fallback": True,
+                    "fallback": False,
                     "exception": agent_error,
                     "provider_failure_type": error_type,
+                    "terminal_model_failure": True,
                 }
                 if error_type == "ProviderProtocolError":
                     trace["provider_protocol_diagnostics"] = getattr(exc, "diagnostics", None)
-                if failure_type == "connection":
+                if getattr(exc, "provider_failure_type", None) == "provider_call":
                     trace["provider_transport_attempts"] = getattr(exc, "attempts", [])
+                terminal_model_failure = True
+                forfeit_winner = 1 - player
+                termination = "model_retry_exhausted_forfeit"
             else:
                 executed = attempted
                 if attempted.tool != expected:
                     agent_error = f"wrong_responder: expected {expected}, got {attempted.tool}"
-                    executed = _passive_fallback(session.duel.pending, session.replay_module)
-                    fallback_reason = "deterministic_fallback_wrong_responder"
-                else:
-                    fallback_reason = "none"
                 trace = (
                     getattr(agent, "last_trace", {})
                     if decision_index not in interventions
                     else {"intervention": True}
                 )
             attempted_invalid = agent_error is not None
-            recovery = fallback_reason if agent_error else "none"
+            recovery = "model_retry_exhausted_forfeit" if terminal_model_failure else "none"
             elapsed = time.perf_counter() - call_started
             diagnostics = _trace_diagnostics(trace, expected)
 
@@ -291,7 +302,7 @@ def run_evidence_duel(
             engine_error: str | None = None
             correction_trace: dict[str, Any] | None = None
             exact_legal_match = True
-            if exact_legal_check_performed:
+            if not terminal_model_failure and exact_legal_check_performed and executed is not None:
                 try:
                     exact_legal_match = exact_legal_action_match(
                         executed,
@@ -304,29 +315,67 @@ def run_evidence_duel(
                         "action_argument_validation_failed: "
                         f"{type(exc).__name__}: {exc}"
                     )
-            if exact_legal_check_performed and not exact_legal_match:
-                if pre_engine_error is None:
+            needs_model_correction = (
+                not terminal_model_failure
+                and (
+                    agent_error is not None
+                    or (exact_legal_check_performed and not exact_legal_match)
+                )
+            )
+            if needs_model_correction:
+                if pre_engine_error is None and exact_legal_check_performed:
                     pre_engine_error = (
                         "action_not_in_exact_legal_set: "
                         f"{executed.tool} {executed.arguments!r}"
                     )
                 attempted_invalid = True
-                corrected: ActionChoice | None = None
-                if decision_index not in interventions and hasattr(agent, "correct_invalid_action"):
-                    try:
-                        corrected, correction_trace = agent.correct_invalid_action(request)
-                    except Exception as exc:  # noqa: BLE001
-                        correction_trace = {"exception": f"{type(exc).__name__}: {exc}"}
-                if corrected is not None and exact_legal_action_match(
-                    corrected, view["actions"], signature=session.action_signature
-                ):
-                    executed = corrected
-                    recovery = "corrected_retry"
+                correction_trace = {"attempts": []}
+                for correction_number in range(2, MAX_MODEL_ACTION_ATTEMPTS + 1):
+                    model_action_attempts = correction_number
+                    corrected: ActionChoice | None = None
+                    attempt_trace: dict[str, Any]
+                    if decision_index in interventions or not hasattr(agent, "correct_invalid_action"):
+                        attempt_trace = {"error": "no_model_correction_available"}
+                    else:
+                        try:
+                            corrected, attempt_trace = agent.correct_invalid_action(request)
+                        except Exception as exc:  # noqa: BLE001
+                            attempt_trace = {"exception": f"{type(exc).__name__}: {exc}"}
+                    correction_trace["attempts"].append(
+                        {
+                            "attempt": correction_number,
+                            "action": asdict(corrected) if corrected is not None else None,
+                            "trace": attempt_trace,
+                        }
+                    )
+                    correction_is_legal = (
+                        corrected is not None
+                        and corrected.tool == expected
+                        and (
+                            not exact_legal_check_performed
+                            or exact_legal_action_match(
+                                corrected,
+                                view["actions"],
+                                signature=session.action_signature,
+                            )
+                        )
+                    )
+                    if correction_is_legal:
+                        executed = corrected
+                        recovery = "corrected_retry"
+                        break
                 else:
-                    executed = _passive_fallback(session.duel.pending, session.replay_module)
-                    recovery = "deterministic_fallback"
-                step = session.execute(executed)
+                    executed = None
+                    terminal_model_failure = True
+                    recovery = "model_retry_exhausted_forfeit"
+                    forfeit_winner = 1 - player
+                    termination = "model_retry_exhausted_forfeit"
+
+            if terminal_model_failure:
+                after = before
+                step = None
             else:
+                assert executed is not None
                 try:
                     step = session.execute(executed)
                 except Exception as exc:  # noqa: BLE001
@@ -341,7 +390,7 @@ def run_evidence_duel(
                         engine_error = f"fallback_failed: {type(fallback_exc).__name__}: {fallback_exc}"
                         termination = "engine_rejection_abort"
                         step = None
-            after = build_oracle_state(session)
+                after = build_oracle_state(session)
             decision_id = f"d{decision_index + 1:06d}"
             action_id = stable_id("action", [config.game_id, decision_id])
             action_summary = {
@@ -349,8 +398,8 @@ def run_evidence_duel(
                 "action_id": action_id,
                 "turn": turn_before,
                 "player": player,
-                "tool": executed.tool,
-                "arguments": executed.arguments,
+                "tool": executed.tool if executed is not None else None,
+                "arguments": executed.arguments if executed is not None else None,
             }
             record = {
                 "type": "decision",
@@ -366,22 +415,27 @@ def run_evidence_duel(
                 "observation": view["observation"],
                 "legal": view["legal"],
                 "attempted_action": asdict(attempted) if attempted else None,
-                "executed_action": asdict(executed),
+                "executed_action": asdict(executed) if executed is not None else None,
                 "action_summary": action_summary,
                 "validation": {
                     "valid": (
                         agent_error is None
                         and not attempted_invalid
                         and engine_error is None
+                        and not terminal_model_failure
                         and not diagnostics["protocol_errors"]
                     ),
                     "agent_error": agent_error,
                     "pre_engine_error": pre_engine_error,
                     "attempted_invalid": attempted_invalid,
                     "recovery": recovery,
+                    "model_action_attempts": model_action_attempts,
+                    "terminal_model_failure": terminal_model_failure,
                     "validation_scope": validation_scope,
                     "exact_legal_check_performed": exact_legal_check_performed,
-                    "engine_submission_attempted": pre_engine_error is None,
+                    "engine_submission_attempted": (
+                        pre_engine_error is None and executed is not None and not terminal_model_failure
+                    ),
                     "recovery_engine_submission_attempted": step is not None,
                     "engine_error": engine_error,
                     **diagnostics,
@@ -407,7 +461,8 @@ def run_evidence_duel(
             oracle.append(oracle_record)
             public.append(record)
             previous_commit = record["commit_hash"]
-            recent_actions.append(action_summary)
+            if executed is not None:
+                recent_actions.append(action_summary)
             decision_index += 1
             if config.checkpoint_interval > 0 and decision_index % config.checkpoint_interval == 0:
                 atomic_write_json(
@@ -427,9 +482,8 @@ def run_evidence_duel(
                 {"status": "RUNNING", "committed_decisions": decision_index},
             )
             registry.renew(config.game_id)
-            if pre_engine_error or engine_error:
-                if engine_error:
-                    break
+            if terminal_model_failure or engine_error:
+                break
 
         if forfeit_winner is None:
             if session.duel.state.game_over:

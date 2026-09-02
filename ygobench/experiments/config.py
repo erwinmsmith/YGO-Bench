@@ -28,7 +28,9 @@ class ExperimentConfig:
     agent2: str
     seed: int
     max_decisions: int = 0
-    schema_version: str = "1.0.0"
+    # v1.1 permits a terminal decision record with no executed engine action
+    # when model-action retries are exhausted and the acting player forfeits.
+    schema_version: str = "1.1.0"
     checkpoint_interval: int = 25
     resume: bool = True
 

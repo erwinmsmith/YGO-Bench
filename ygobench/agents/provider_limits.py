@@ -21,16 +21,14 @@ def scrub_reasoning_content(value: Any) -> Any:
     return value
 
 
-def omit_deepseek_token_limit(provider: Any) -> Any:
-    """Make DeepSeek requests omit ``max_tokens`` instead of setting a cap.
+def omit_reasoning_model_token_limit(provider: Any) -> Any:
+    """Make supported reasoning-model requests omit ``max_tokens``.
 
-    The vendored provider currently always supplies the field, including when
-    its constructor default is used. Wrapping the SDK call keeps the upstream
-    submodule untouched while ensuring the wire request has no output-token
-    limit field.
+    DashScope Qwen and DeepSeek both permit long reasoning/tool-use turns.
+    The vendored providers supply a constructor default even when YGO-Bench
+    intentionally has no cap, so remove the wire field at the SDK boundary.
     """
-
-    if getattr(provider, "name", None) != "deepseek" or getattr(
+    if getattr(provider, "name", None) not in {"deepseek", "dashscope"} or getattr(
         provider, "_ygobench_uncapped", False
     ):
         return provider
@@ -46,6 +44,12 @@ def omit_deepseek_token_limit(provider: Any) -> Any:
     provider.max_tokens = None
     provider._ygobench_uncapped = True
     return provider
+
+
+def omit_deepseek_token_limit(provider: Any) -> Any:
+    """Backward-compatible alias for the former DeepSeek-only helper."""
+
+    return omit_reasoning_model_token_limit(provider)
 
 
 def force_single_tool_call(provider: Any) -> Any:

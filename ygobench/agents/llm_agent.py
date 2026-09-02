@@ -12,7 +12,7 @@ from typing import Any
 from ygobench.agents.base import BaseAgent
 from ygobench.agents.provider_limits import (
     force_single_tool_call,
-    omit_deepseek_token_limit,
+    omit_reasoning_model_token_limit,
     scrub_reasoning_content,
 )
 from ygobench.config import ModelConfig
@@ -21,8 +21,12 @@ from ygobench.engine.upstream import UpstreamLayout
 from ygobench.engine.visibility import sanitize_events_for_player
 
 PROMPT_ROOT = Path(__file__).parent / "prompts"
-MAX_PROVIDER_CONNECTION_RETRIES = 3
-CONNECTION_RETRY_DELAYS_SECONDS = (10.0, 10.0, 10.0)
+# These are total attempts, not retries after an initial request.  The duel
+# runner treats exhaustion as a model-action failure and awards the game to
+# the opponent; it must never silently substitute a game action.
+MAX_PROVIDER_CONNECTION_ATTEMPTS = 3
+CONNECTION_RETRY_DELAYS_SECONDS = (10.0, 10.0)
+MAX_MODEL_ACTION_ATTEMPTS = 3
 
 
 def _provider_runtime():
@@ -141,10 +145,10 @@ class ProviderProtocolError(RuntimeError):
         super().__init__("invalid_tool_message_transcript: " + json.dumps(diagnostics, sort_keys=True))
 
 
-class ProviderConnectionError(RuntimeError):
-    """A transient provider failure after all bounded retries are exhausted."""
+class ProviderCallError(RuntimeError):
+    """A provider request failure after all three bounded attempts are exhausted."""
 
-    provider_failure_type = "connection"
+    provider_failure_type = "provider_call"
 
     def __init__(self, cause: Exception, attempts: list[dict[str, Any]]) -> None:
         self.attempts = attempts
@@ -192,10 +196,6 @@ def _tool_protocol_diagnostics(messages: list[dict[str, Any]]) -> dict[str, Any]
     }
 
 
-def _is_connection_error(exc: Exception) -> bool:
-    return type(exc).__name__ in {"APIConnectionError", "APITimeoutError"}
-
-
 class LLMFullDuelAgent(BaseAgent):
     """Select exactly one ocgcore response tool for each pending decision."""
 
@@ -206,7 +206,7 @@ class LLMFullDuelAgent(BaseAgent):
         max_tokens: int | None = None,
         temperature: float = 0.0,
         max_inspections: int = 8,
-        max_forced_retries: int = 2,
+        max_forced_retries: int = MAX_MODEL_ACTION_ATTEMPTS - 1,
         thinking_enabled: bool = True,
         profile: str = "react",
     ) -> None:
@@ -217,16 +217,20 @@ class LLMFullDuelAgent(BaseAgent):
         if model.base_url:
             kwargs["base_url"] = model.base_url
         self._provider = get_provider(model.provider, model.model, **kwargs)
-        if model.provider == "deepseek" and max_tokens is None:
-            omit_deepseek_token_limit(self._provider)
-        force_single_tool_call(self._provider)
-        if model.provider == "deepseek" and not thinking_enabled:
+        if model.provider in {"deepseek", "dashscope"} and max_tokens is None:
+            omit_reasoning_model_token_limit(self._provider)
+        # DashScope's documented compatible-mode example does not expose this
+        # optional OpenAI flag.  Prompt/schema validation enforce one action,
+        # while avoiding a provider-specific unsupported request parameter.
+        if model.provider != "dashscope":
+            force_single_tool_call(self._provider)
+        if model.provider in {"deepseek", "dashscope"} and not thinking_enabled:
             self._provider.reasoning_effort = None
             self._provider.thinking_enabled = False
         self._tool_defs = {tool["name"]: tool for tool in tools_module.TOOLS}
         self._max_inspections = max_inspections
         self._max_forced_retries = max_forced_retries
-        self._max_provider_connection_retries = MAX_PROVIDER_CONNECTION_RETRIES
+        self._max_provider_connection_attempts = MAX_PROVIDER_CONNECTION_ATTEMPTS
         self._system_prompt = (PROMPT_ROOT / "full_duel_system.md").read_text()
         self._observation_template = (PROMPT_ROOT / "full_duel_observation.md").read_text()
         self.name = f"{profile}:{model.provider}:{model.model}"
@@ -258,7 +262,12 @@ class LLMFullDuelAgent(BaseAgent):
         requests: list[dict[str, Any]],
         transport_attempts: list[dict[str, Any]],
     ) -> Any:
-        """Validate the transcript then retry only transient transport errors."""
+        """Validate the transcript and make at most three provider requests.
+
+        The provider SDK may label failures as connection, timeout, status, or
+        decoding errors.  All occur before a game action exists, so they share
+        the same bounded retry policy and are preserved in the evidence trace.
+        """
 
         diagnostics = _tool_protocol_diagnostics(messages)
         if diagnostics["unresolved_tool_call_ids"] or diagnostics["protocol_errors"]:
@@ -268,10 +277,10 @@ class LLMFullDuelAgent(BaseAgent):
                 {"system": system, "messages": deepcopy(messages), "tools": deepcopy(tools)}
             )
         )
-        max_connection_retries = getattr(
-            self, "_max_provider_connection_retries", MAX_PROVIDER_CONNECTION_RETRIES
+        max_connection_attempts = getattr(
+            self, "_max_provider_connection_attempts", MAX_PROVIDER_CONNECTION_ATTEMPTS
         )
-        for attempt in range(max_connection_retries + 1):
+        for attempt in range(max_connection_attempts):
             try:
                 turn = self._provider.respond(system=system, messages=messages, tools=tools)
                 self._accumulate(turn.usage, turn.wallclock_seconds)
@@ -280,19 +289,16 @@ class LLMFullDuelAgent(BaseAgent):
                 )
                 return turn
             except Exception as exc:  # noqa: BLE001
-                retryable = _is_connection_error(exc)
                 transport_attempts.append(
                     {
                         "attempt": attempt + 1,
                         "outcome": "error",
                         "error_type": type(exc).__name__,
-                        "retryable": retryable,
+                        "retryable": True,
                     }
                 )
-                if not retryable:
-                    raise
-                if attempt >= max_connection_retries:
-                    raise ProviderConnectionError(exc, transport_attempts) from exc
+                if attempt + 1 >= max_connection_attempts:
+                    raise ProviderCallError(exc, transport_attempts) from exc
                 time.sleep(CONNECTION_RETRY_DELAYS_SECONDS[attempt])
 
     def predict(self, decision: DecisionRequest) -> ActionChoice:
@@ -313,8 +319,13 @@ class LLMFullDuelAgent(BaseAgent):
         response_tool = self._tool_defs.get(responder)
         if response_tool is None:
             self.invalid_outputs += 1
-            self.last_trace = {"error": f"No tool schema for responder {responder}"}
-            return decision.legal_actions[0]
+            diagnostics = {
+                "protocol_errors": ["missing_response_tool_schema"],
+                "responder": responder,
+                "model_action_attempts": 0,
+            }
+            self.last_trace = {"fallback": False, "error": diagnostics}
+            raise ProviderProtocolError(diagnostics)
 
         prompt = self._observation_template.replace(
             "{{STATE_JSON}}", json.dumps(state, ensure_ascii=False, indent=2, default=str)
@@ -329,6 +340,7 @@ class LLMFullDuelAgent(BaseAgent):
         traces: list[dict[str, Any]] = []
         requests: list[dict[str, Any]] = []
         transport_attempts: list[dict[str, Any]] = []
+        protocol_failures: list[dict[str, Any]] = []
 
         while inspections <= self._max_inspections:
             turn = self._respond_once(
@@ -353,18 +365,20 @@ class LLMFullDuelAgent(BaseAgent):
             }
             traces.append(trace)
             if len(turn.tool_calls) > 1:
-                raise ProviderProtocolError(
+                protocol_failures.append(
                     {
+                        "attempt": len(traces),
                         "protocol_errors": ["multiple_tool_calls_in_single_model_turn"],
                         "assistant_tool_call_count": len(turn.tool_calls),
-                        "tool_result_count": 0,
                         "tool_names": [call.name for call in turn.tool_calls],
                         "tool_call_ids": [call.id for call in turn.tool_calls],
-                        "tool_result_ids": [],
-                        "unresolved_tool_call_ids": len(turn.tool_calls),
                     }
                 )
-            action_call = next((call for call in turn.tool_calls if call.name == responder), None)
+                action_call = None
+            else:
+                action_call = next(
+                    (call for call in turn.tool_calls if call.name == responder), None
+                )
             if action_call is not None:
                 self.last_trace = {
                     "requests": requests,
@@ -379,7 +393,7 @@ class LLMFullDuelAgent(BaseAgent):
                 )
 
             inspect_calls = [call for call in turn.tool_calls if call.name == "inspect_card"]
-            if inspect_calls and inspections < self._max_inspections:
+            if len(turn.tool_calls) == 1 and inspect_calls and inspections < self._max_inspections:
                 messages.append(
                     {
                         "role": "assistant",
@@ -439,14 +453,21 @@ class LLMFullDuelAgent(BaseAgent):
             break
 
         self.invalid_outputs += 1
+        diagnostics = {
+            "protocol_errors": ["missing_required_responder_tool_call"],
+            "model_action_attempts": forced_retries + 1,
+            "forced_corrections": forced_retries,
+            "attempt_failures": protocol_failures,
+        }
         self.last_trace = {
             "requests": requests,
             "turns": traces,
             "transport_attempts": transport_attempts,
-            "fallback": True,
-            "error": "model did not call required responder",
+            "fallback": False,
+            "terminal_model_failure": True,
+            "error": diagnostics,
         }
-        return decision.legal_actions[0]
+        raise ProviderProtocolError(diagnostics)
 
     def correct_invalid_action(self, decision: DecisionRequest) -> tuple[ActionChoice | None, dict[str, Any]]:
         """Request one replacement from the authoritative legal action list.
@@ -495,8 +516,12 @@ class LLMFullDuelAgent(BaseAgent):
             "provider_data": scrub_reasoning_content(turn.provider_data),
             "transport_attempts": transport_attempts,
         }
+        if len(turn.tool_calls) != 1:
+            trace["protocol_errors"] = ["multiple_tool_calls_in_single_model_turn"]
+            return None, trace
         call = next((item for item in turn.tool_calls if item.name == responder), None)
         if call is None:
+            trace["protocol_errors"] = ["missing_required_responder_tool_call"]
             return None, trace
         return ActionChoice(tool=call.name, arguments=call.arguments, label=call.name), trace
 

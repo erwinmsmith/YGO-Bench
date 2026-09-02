@@ -365,6 +365,114 @@ def write_offline_exp6_metrics(
     return metrics
 
 
+def aggregate_offline_exp6_metrics(run_dir: Path) -> dict[str, Any]:
+    """Aggregate the offline Exp6 reports for every game in one run.
+
+    Per-game phase-4 reports remain the authoritative audit artifacts.  This
+    function creates the run-level metric without rerunning a duel or making
+    model calls, so it is safe to invoke after any subset of games has finished.
+    """
+    per_game: list[dict[str, Any]] = []
+    completed: list[dict[str, Any]] = []
+    failure_reasons: Counter[str] = Counter()
+    commitment_points = eligible_counterfactuals = 0
+    missing_reports: list[str] = []
+
+    for manifest_path in sorted((run_dir / "games").glob("*/manifest.json")):
+        game_dir = manifest_path.parent
+        game_id = game_dir.name
+        reversibility = read_json(game_dir / "reversibility_report.json")
+        audit = read_json(game_dir / "exp6_offline_report.json")
+        if not audit:
+            missing_reports.append(game_id)
+            per_game.append(
+                {
+                    "game_id": game_id,
+                    "status": "MISSING",
+                    "reversibility_passed": bool(reversibility.get("passed")),
+                    "sampled_counterfactuals": 0,
+                }
+            )
+            continue
+
+        inventory = audit.get("candidate_inventory", {})
+        commitment_points += int(inventory.get("commitment_points", 0))
+        eligible_counterfactuals += int(inventory.get("eligible_counterfactuals", 0))
+        game_completed = [
+            result
+            for result in audit.get("results", [])
+            if result.get("status") == "COMPLETED"
+        ]
+        completed.extend(game_completed)
+        failures = [
+            result["action_sequence_survival"]["first_failure"]
+            for result in game_completed
+            if result["action_sequence_survival"].get("first_failure") is not None
+        ]
+        failure_reasons.update(failure["reason"] for failure in failures)
+        per_game.append(
+            {
+                "game_id": game_id,
+                "status": audit.get("status", "SKIPPED"),
+                "reversibility_passed": bool(reversibility.get("passed")),
+                "reversibility_sample_size": int(reversibility.get("sample_size", 0)),
+                "candidate_inventory": inventory,
+                "sampled_counterfactuals": len(game_completed),
+                "ineligibility_reason": audit.get("reason"),
+            }
+        )
+
+    survivals = [
+        result["action_sequence_survival"]["survived_actions"] for result in completed
+    ]
+    failures = [
+        result
+        for result in completed
+        if result["action_sequence_survival"].get("first_failure") is not None
+    ]
+    metrics = {
+        "experiment": 6,
+        "mode": "offline_legal_counterfactual_plan_robustness",
+        "status": "COMPLETED" if not missing_reports else "PARTIAL",
+        "games_observed": len(per_game),
+        "games_with_missing_report": missing_reports,
+        "reversibility_gate": {
+            "passed_games": sum(row["reversibility_passed"] for row in per_game),
+            "observed_games": len(per_game),
+        },
+        "candidate_inventory": {
+            "commitment_points": commitment_points,
+            "eligible_counterfactuals": eligible_counterfactuals,
+        },
+        "sampled_counterfactuals": len(completed),
+        "state_changed_rate": (
+            sum(result["state_changed"] for result in completed) / len(completed)
+            if completed
+            else None
+        ),
+        "horizon_plan_invalidation_rate": {
+            "numerator": len(failures),
+            "denominator": len(completed),
+            "estimate": len(failures) / len(completed) if completed else None,
+            "direction": "lower_is_better",
+        },
+        "action_sequence_survival": {
+            "median_steps": median(survivals) if survivals else None,
+            "mean_steps": sum(survivals) / len(survivals) if survivals else None,
+            "right_censored": sum(
+                result["action_sequence_survival"]["right_censored"]
+                for result in completed
+            ),
+        },
+        "first_failure_reasons": dict(sorted(failure_reasons.items())),
+        "full_duel_continuations": 0,
+        "llm_calls": 0,
+        "per_game": per_game,
+    }
+    atomic_write_json(run_dir / "metrics" / "exp6" / "metrics.json", metrics)
+    return metrics
+
+
 def find_interruption_candidate(game_dir: Path) -> dict[str, Any] | None:
     rows = JsonlJournal(game_dir / "trajectory.jsonl").recover()
     for index, row in enumerate(rows):

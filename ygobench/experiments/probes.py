@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from ygobench.agents.llm_agent import compact_prompt_state
-from ygobench.agents.provider_limits import omit_deepseek_token_limit
+from ygobench.agents.provider_limits import omit_reasoning_model_token_limit
+from ygobench.config import default_model_config
 from ygobench.engine.upstream import UpstreamLayout
 from ygobench.experiments.io import JsonlJournal, content_hash
 
@@ -18,25 +20,92 @@ ForecastSampling = Literal["chronological", "stratified"]
 T = TypeVar("T")
 
 
-def _provider(model: str):
+def probe_evaluator_id(provider_name: str | None = None, model: str | None = None) -> str:
+    """Stable filesystem-safe identifier for a post-hoc probe evaluator."""
+
+    config = default_model_config(provider=provider_name, model=model)
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", f"{config.provider}__{config.model}")
+
+
+def _provider(provider_name: str | None = None, model: str | None = None):
     layout = UpstreamLayout()
     source = str(layout.root / "src")
     if source not in sys.path:
         sys.path.insert(0, source)
     from providers import get_provider  # type: ignore[import-not-found]
 
-    provider = get_provider("deepseek", model, temperature=0.0)
-    omit_deepseek_token_limit(provider)
-    provider.reasoning_effort = None
-    provider.thinking_enabled = False
+    config = default_model_config(provider=provider_name, model=model)
+    provider = get_provider(
+        config.provider,
+        config.model,
+        temperature=0.0,
+        **({"base_url": config.base_url} if config.base_url else {}),
+    )
+    omit_reasoning_model_token_limit(provider)
+    if hasattr(provider, "reasoning_effort"):
+        provider.reasoning_effort = None
+    if hasattr(provider, "thinking_enabled"):
+        provider.thinking_enabled = False
     return provider
 
 
-def _state_truth(observation: dict[str, Any], oracle: dict[str, Any]) -> dict[str, Any]:
+def _named_visible_cards(side: dict[str, Any]) -> list[str]:
+    """Return only card identities objectively public in a rendered side."""
+
+    cards: list[str] = []
+    for zone in (
+        "monster_zone",
+        "spell_trap_zone",
+        "field_zone",
+        "pendulum_zone",
+        "graveyard",
+        "banished",
+    ):
+        values = side.get(zone, [])
+        if isinstance(values, dict):
+            values = [values]
+        if not isinstance(values, list):
+            continue
+        for card in values:
+            if isinstance(card, dict) and card.get("name") and not card.get("face_down"):
+                cards.append(str(card["name"]))
+    return sorted(cards)
+
+
+def _historical_truth(public_prefix: list[dict[str, Any]]) -> dict[str, Any]:
+    """Truth slots derivable from the same public action/event prefix as the probe.
+
+    The engine does not expose an effect-use registry, so this deliberately
+    measures auditable public history rather than fabricating hidden flags.
+    """
+
+    activation_counts = [0, 0]
+    event_types: list[str] = []
+    for row in public_prefix:
+        action = row.get("executed_action") or {}
+        arguments = action.get("arguments", {}) if isinstance(action, dict) else {}
+        if arguments.get("command") == "activate":
+            activation_counts[int(row.get("player", 0))] += 1
+        for event in row.get("engine_events", []):
+            if isinstance(event, dict) and event.get("msg_name"):
+                event_types.append(str(event["msg_name"]))
+    return {
+        "player0_public_activation_count": activation_counts[0],
+        "player1_public_activation_count": activation_counts[1],
+        # Keeping the suffix bounded prevents a long duel from turning this
+        # slot into an unbounded transcription task while retaining recent
+        # chain/resolution history.
+        "recent_public_engine_event_types": event_types[-12:],
+    }
+
+
+def _state_truth(
+    observation: dict[str, Any], oracle: dict[str, Any], public_prefix: list[dict[str, Any]]
+) -> dict[str, Any]:
     field = oracle.get("field", {})
     players = field.get("players", [{}, {}])
     tracked = oracle.get("tracked", {})
-    return {
+    truth = {
         "turn": int(tracked.get("turn_count", observation.get("turn", 0))),
         "turn_player": int(tracked.get("turn_player", 0)),
         "phase": str(observation.get("phase", "")),
@@ -47,6 +116,93 @@ def _state_truth(observation: dict[str, Any], oracle: dict[str, Any]) -> dict[st
         "player1_hand_count": int(players[1].get("hand_count_raw", 0)),
         "player0_grave_count": int(players[0].get("grave_count_raw", 0)),
         "player1_grave_count": int(players[1].get("grave_count_raw", 0)),
+    }
+    truth.update(_public_zone_truth(observation))
+    perspective = int(observation.get("perspective_player", 0))
+    sides = {
+        perspective: observation.get("you", {}),
+        1 - perspective: observation.get("opponent", {}),
+    }
+    for player in (0, 1):
+        # The observation is perspective-relative, so resolve absolute seats
+        # before taking public zone/resource counts from it.
+        side = sides[player]
+        truth[f"player{player}_banished_count"] = int(side.get("banished_count", 0))
+        truth[f"player{player}_extra_deck_count"] = int(side.get("extra_deck_count", 0))
+        truth[f"player{player}_known_public_cards"] = _named_visible_cards(side)
+    truth.update(_historical_truth(public_prefix))
+    return truth
+
+
+def _public_zone_truth(observation: dict[str, Any]) -> dict[str, list[str]]:
+    """Canonical public face-up cards, expressed from absolute player seats."""
+    perspective = int(observation.get("perspective_player", 0))
+    sides = {perspective: observation.get("you", {}), 1 - perspective: observation.get("opponent", {})}
+
+    def names(player: int, zone: str) -> list[str]:
+        cards = sides[player].get(zone, []) if isinstance(sides[player], dict) else []
+        return sorted(
+            str(card["name"])
+            for card in cards
+            if isinstance(card, dict)
+            and not card.get("empty")
+            and not card.get("face_down")
+            and card.get("name")
+        )
+
+    return {
+        "player0_faceup_monsters": names(0, "monster_zone"),
+        "player1_faceup_monsters": names(1, "monster_zone"),
+        "player0_faceup_spells_traps": names(0, "spell_trap_zone"),
+        "player1_faceup_spells_traps": names(1, "spell_trap_zone"),
+    }
+
+
+def _zone_transition_count(row: dict[str, Any]) -> int:
+    names = {"MSG_MOVE", "MSG_POS_CHANGE", "MSG_SWAP", "MSG_SHUFFLE_HAND", "MSG_SHUFFLE_DECK"}
+    return sum(event.get("msg_name") in names for event in row.get("engine_events", []))
+
+
+def _checkpoint_indices(public: list[dict[str, Any]]) -> dict[int, list[str]]:
+    """PDF-specified quartiles plus deterministic high-complexity checkpoints."""
+    tags: dict[int, list[str]] = {}
+
+    def add(index: int, tag: str) -> None:
+        tags.setdefault(index, []).append(tag)
+
+    for fraction, tag in ((0.25, "trajectory_25"), (0.5, "trajectory_50"), (0.75, "trajectory_75"), (0.9, "trajectory_90")):
+        add(min(len(public) - 1, round(fraction * (len(public) - 1))), tag)
+    special = {
+        "chain_depth_ge_2": [index for index, row in enumerate(public) if len(row.get("observation", {}).get("chain", [])) >= 2],
+        "zone_transition_heavy": [index for index, row in enumerate(public) if _zone_transition_count(row) >= 2],
+        "opponent_response": [
+            index
+            for index, row in enumerate(public)
+            if row.get("legal", {}).get("expected_responder") == "select_chain"
+            and row.get("executed_action", {}).get("arguments", {}).get("index") is not None
+        ],
+    }
+    for tag, candidates in special.items():
+        if candidates:
+            add(candidates[len(candidates) // 2], tag)
+    return tags
+
+
+def _forecast_strata(observation: dict[str, Any], deck_matchup: str) -> dict[str, Any]:
+    you = observation.get("you", {})
+    opponent = observation.get("opponent", {})
+    backrow = opponent.get("spell_trap_zone", []) if isinstance(opponent, dict) else []
+    set_cards = sum(
+        bool(isinstance(card, dict) and card.get("face_down")) for card in backrow
+    )
+    opponent_hand = int(opponent.get("hand_count", 0)) if isinstance(opponent, dict) else 0
+    return {
+        "turn_stage": str(observation.get("phase", "unknown")),
+        "hand_size": int(you.get("hand_count", 0)) if isinstance(you, dict) else 0,
+        "opponent_set_card_count": set_cards,
+        "chain_depth": len(observation.get("chain", [])),
+        "deck_matchup": deck_matchup,
+        "hidden_information_density": opponent_hand + set_cards,
     }
 
 
@@ -183,13 +339,7 @@ def extract_probe_samples(
         oracle = JsonlJournal(game_dir / "oracle_trajectory.jsonl").recover()
         if not public:
             continue
-        indices = sorted(
-            {
-                min(len(public) - 1, round(fraction * (len(public) - 1)))
-                for fraction in (0.25, 0.5, 0.75, 0.9)
-            }
-        )
-        for index in indices:
+        for index, checkpoint_tags in sorted(_checkpoint_indices(public).items()):
             prefix = {
                 "initial_public_state": _initial_public_summary(public[0]["observation"]),
                 "executed_history": [
@@ -215,14 +365,28 @@ def extract_probe_samples(
                     "game_id": public[index]["game_id"],
                     "decision_id": public[index]["decision_id"],
                     "trajectory_progress": (index + 1) / len(public),
+                    "checkpoint_tags": sorted(checkpoint_tags),
+                    "state_complexity": {
+                        "chain_depth": len(public[index]["observation"].get("chain", [])),
+                        "zone_transition_events": _zone_transition_count(public[index]),
+                        "historical_action_count": index,
+                        "historical_public_activation_count": sum(
+                            1
+                            for row in public[:index]
+                            if row.get("executed_action", {}).get("arguments", {}).get("command") == "activate"
+                        ),
+                    },
                     "prefix": prefix,
                     "ground_truth": _state_truth(
-                        public[index]["observation"], oracle[index]["before"]
+                        public[index]["observation"], oracle[index]["before"], public[:index]
                     ),
                 }
             )
             state_count += 1
 
+        manifest = json.loads((game_dir / "manifest.json").read_text(encoding="utf-8"))
+        config = manifest["config"]
+        deck_matchup = f"{config['deck1']}__vs__{config['deck2']}"
         forecast_candidates: list[dict[str, Any]] = []
         for index, row in enumerate(public):
             if not row.get("validation", {}).get("valid", False):
@@ -263,6 +427,7 @@ def extract_probe_samples(
                     "actual_opponent_response": actual_response,
                     "availability_ground_truth": int(availability),
                     "behavior_ground_truth": int(behavior),
+                    "strata": _forecast_strata(row["observation"], deck_matchup),
                 }
             )
 
@@ -290,19 +455,22 @@ def extract_probe_samples(
 def run_probes(
     run_dir: Path,
     *,
-    model: str = "deepseek-v4-flash",
+    provider_name: str | None = None,
+    model: str | None = None,
     max_state_samples: int = 4,
     max_forecast_samples: int = 4,
 ) -> dict[str, int]:
-    provider = _provider(model)
+    evaluator_id = probe_evaluator_id(provider_name, model)
+    provider = _provider(provider_name, model)
     state_samples = JsonlJournal(run_dir / "derived" / "state_probe_samples.jsonl").recover()[
         :max_state_samples
     ]
     forecast_samples = JsonlJournal(run_dir / "derived" / "forecast_samples.jsonl").recover()[
         :max_forecast_samples
     ]
-    state_out = JsonlJournal(run_dir / "derived" / "state_probe_results.jsonl")
-    forecast_out = JsonlJournal(run_dir / "derived" / "forecast_results.jsonl")
+    output_dir = run_dir / "derived" / "probe_results" / evaluator_id
+    state_out = JsonlJournal(output_dir / "state_probe_results.jsonl")
+    forecast_out = JsonlJournal(output_dir / "forecast_results.jsonl")
     state_hashes = {sample["sample_id"]: content_hash(sample) for sample in state_samples}
     forecast_hashes = {
         sample["sample_id"]: content_hash(sample) for sample in forecast_samples
@@ -321,13 +489,20 @@ def run_probes(
     forecast_out.rewrite(retained_forecast)
     completed_state = {row["sample_id"] for row in retained_state}
     completed_forecast = {row["sample_id"] for row in retained_forecast}
+    def schema_for(value: Any) -> dict[str, Any]:
+        if isinstance(value, int):
+            return {"type": "integer"}
+        if isinstance(value, list):
+            return {"type": "array", "items": {"type": "string"}}
+        return {"type": "string"}
+
     state_tool = {
         "name": "report_state",
         "description": "Report the reconstructed public duel state.",
         "input_schema": {
             "type": "object",
             "properties": {
-                key: {"type": "integer" if isinstance(value, int) else "string"}
+                key: schema_for(value)
                 for key, value in state_samples[0]["ground_truth"].items()
             }
             if state_samples
@@ -355,6 +530,9 @@ def run_probes(
                 "sample_hash": state_hashes[sample["sample_id"]],
                 "ground_truth": sample["ground_truth"],
                 "prediction": call.arguments if call else None,
+                "trajectory_progress": sample["trajectory_progress"],
+                "checkpoint_tags": sample["checkpoint_tags"],
+                "state_complexity": sample["state_complexity"],
                 "usage": turn.usage,
                 "elapsed_seconds": turn.wallclock_seconds,
             }
@@ -421,11 +599,13 @@ def run_probes(
                 "behavior_ground_truth": sample["behavior_ground_truth"],
                 "availability_probability": availability_probability,
                 "behavior_probability": behavior_probability,
+                "strata": sample["strata"],
                 "usage": turn.usage,
                 "elapsed_seconds": turn.wallclock_seconds,
             }
         )
     return {
+        "evaluator_id": evaluator_id,
         "state_results": len(state_out.recover()),
         "forecast_results": len(forecast_out.recover()),
     }
