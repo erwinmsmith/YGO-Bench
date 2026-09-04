@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+import sys
 import time
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -27,6 +28,33 @@ from ygobench.experiments.registry import TaskRegistry
 from ygobench.experiments.session import DuelSession
 
 MAX_MODEL_ACTION_ATTEMPTS = 3
+
+
+def _export_web_replay(run_dir: Path, game_dir: Path) -> None:
+    """Create the web replay projection without compromising raw evidence."""
+
+    exporter = PROJECT_ROOT / "scripts" / "export_experiment_replays.py"
+    status: dict[str, Any] = {
+        "status": "FAILED",
+        "exporter": str(exporter),
+    }
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(exporter), "--run-id", run_dir.name],
+            cwd=PROJECT_ROOT,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        status["status"] = "COMPLETED" if completed.returncode == 0 else "FAILED"
+        status["returncode"] = completed.returncode
+        if completed.stdout:
+            status["stdout"] = completed.stdout[-4000:]
+        if completed.stderr:
+            status["stderr"] = completed.stderr[-4000:]
+    except Exception as exc:  # noqa: BLE001
+        status["error"] = f"{type(exc).__name__}: {exc}"
+    atomic_write_json(game_dir / "replay_export_status.json", status)
 
 
 def _file_hash(path: Path) -> str:
@@ -159,6 +187,7 @@ def run_evidence_duel(
     outcome_path = game_dir / "outcome.json"
     existing_outcome = read_json(outcome_path)
     if existing_outcome and existing_outcome.get("game_over"):
+        _export_web_replay(run_dir, game_dir)
         return existing_outcome
 
     registry = TaskRegistry(run_dir / "task_state.sqlite")
@@ -542,6 +571,7 @@ def run_evidence_duel(
             "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
         atomic_write_json(outcome_path, outcome)
+        _export_web_replay(run_dir, game_dir)
         atomic_write_json(
             game_dir / "status.json",
             {"status": "COMPLETED", "committed_decisions": decision_index},
