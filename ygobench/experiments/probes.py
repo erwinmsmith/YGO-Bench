@@ -35,11 +35,13 @@ def _provider(provider_name: str | None = None, model: str | None = None):
     from providers import get_provider  # type: ignore[import-not-found]
 
     config = default_model_config(provider=provider_name, model=model)
+    backend = config.backend or config.provider
     provider = get_provider(
-        config.provider,
+        backend,
         config.model,
         temperature=0.0,
         **({"base_url": config.base_url} if config.base_url else {}),
+        **({"api_key": config.api_key} if config.api_key else {}),
     )
     omit_reasoning_model_token_limit(provider)
     if hasattr(provider, "reasoning_effort"):

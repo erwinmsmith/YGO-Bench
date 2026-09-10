@@ -216,15 +216,20 @@ class LLMFullDuelAgent(BaseAgent):
             kwargs["max_tokens"] = max_tokens
         if model.base_url:
             kwargs["base_url"] = model.base_url
-        self._provider = get_provider(model.provider, model.model, **kwargs)
-        if model.provider in {"deepseek", "dashscope"} and max_tokens is None:
+        if model.api_key:
+            kwargs["api_key"] = model.api_key
+        backend = model.backend or model.provider
+        if backend == "openai" and model.base_url:
+            kwargs["extra_body"] = {"enable_thinking": thinking_enabled}
+        self._provider = get_provider(backend, model.model, **kwargs)
+        if backend in {"deepseek", "dashscope"} and max_tokens is None:
             omit_reasoning_model_token_limit(self._provider)
         # DashScope's documented compatible-mode example does not expose this
         # optional OpenAI flag.  Prompt/schema validation enforce one action,
         # while avoiding a provider-specific unsupported request parameter.
-        if model.provider != "dashscope":
+        if backend != "dashscope":
             force_single_tool_call(self._provider)
-        if model.provider in {"deepseek", "dashscope"} and not thinking_enabled:
+        if backend in {"deepseek", "dashscope"} and not thinking_enabled:
             self._provider.reasoning_effort = None
             self._provider.thinking_enabled = False
         self._tool_defs = {tool["name"]: tool for tool in tools_module.TOOLS}
@@ -235,6 +240,8 @@ class LLMFullDuelAgent(BaseAgent):
         self._observation_template = (PROMPT_ROOT / "full_duel_observation.md").read_text()
         self.name = f"{profile}:{model.provider}:{model.model}"
         self.provider_config = self._provider.provider_config_for_log()
+        self.provider_config["profile"] = model.provider
+        self.provider_config["thinking_enabled"] = thinking_enabled
         self.usage: dict[str, float] = {}
         self.model_calls = 0
         self.invalid_outputs = 0

@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from ygobench.bench.eval_pipeline import EvalConfig, run_evaluation
@@ -19,7 +20,7 @@ from ygobench.engine.upstream import UpstreamLayout
 def _add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--provider",
-        choices=["anthropic", "openai", "vllm", "deepseek", "claude-cli"],
+        choices=["anthropic", "openai", "vllm", "deepseek", "claude-cli", "bailian", "external"],
         default=None,
     )
     parser.add_argument("--model", default=None)
@@ -117,8 +118,8 @@ def _doctor(layout: UpstreamLayout) -> int:
 def _eval(args: argparse.Namespace) -> int:
     model = default_model_config(args.provider, args.model)
     if args.base_url:
-        model = type(model)(provider=model.provider, model=model.model, base_url=args.base_url)
-    missing = missing_api_key(model.provider)
+        model = replace(model, base_url=args.base_url)
+    missing = missing_api_key(model)
     if missing and not args.dry_run:
         env_path = PROJECT_ROOT / ".env"
         print(f"Missing {missing}. Add it to {env_path} or the shell.", file=sys.stderr)
