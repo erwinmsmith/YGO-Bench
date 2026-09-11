@@ -240,7 +240,7 @@ class LLMFullDuelAgent(BaseAgent):
         self._observation_template = (PROMPT_ROOT / "full_duel_observation.md").read_text()
         self.name = f"{profile}:{model.provider}:{model.model}"
         self.provider_config = self._provider.provider_config_for_log()
-        self.provider_config["profile"] = model.provider
+        self.provider_config["profile"] = profile
         self.provider_config["thinking_enabled"] = thinking_enabled
         self.usage: dict[str, float] = {}
         self.model_calls = 0

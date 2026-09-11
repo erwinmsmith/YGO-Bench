@@ -16,6 +16,11 @@ from ygobench.config import PROJECT_ROOT
 from ygobench.engine.full_duel import _derive_deck_shuffle_seeds, _passive_fallback
 from ygobench.engine.protocol import ActionChoice, DecisionRequest
 from ygobench.experiments.config import ExperimentConfig, stable_id
+from ygobench.experiments.identity import (
+    model_configuration_id,
+    policy_descriptor,
+    policy_id,
+)
 from ygobench.experiments.io import (
     JsonlJournal,
     atomic_write_json,
@@ -134,15 +139,80 @@ def _reconcile(public: JsonlJournal, oracle: JsonlJournal) -> tuple[list[dict], 
     return public_rows[:common], oracle_rows[:common]
 
 
-def _manifest(config: ExperimentConfig, game_dir: Path) -> dict[str, Any]:
+def _decision_error_code(
+    *,
+    expected_responder: str,
+    attempted: ActionChoice | None,
+    trace: dict[str, Any],
+    diagnostics: dict[str, Any],
+    agent_error: str | None,
+    pre_engine_error: str | None,
+    engine_rejection_error: str | None,
+    engine_error: str | None,
+    terminal_model_failure: bool,
+) -> str | None:
+    """Assign one structured primary failure code at the evidence source."""
+    if trace.get("provider_failure_type") not in (None, "ProviderProtocolError"):
+        return "engine_or_protocol_parsing_error"
+    protocol_errors = diagnostics.get("protocol_errors") or []
+    if any("multiple" in str(error) for error in protocol_errors):
+        return "multiple_tool_call"
+    if agent_error and agent_error.startswith("wrong_responder"):
+        return "wrong_responder"
+    raw = " ".join(
+        str(value or "") for value in (agent_error, pre_engine_error, *protocol_errors)
+    ).lower()
+    if "missing" in raw and ("tool" in raw or "responder" in raw):
+        return "missing_tool_call"
+    if pre_engine_error:
+        if "stale" in raw:
+            return "stale_action_or_index"
+        if pre_engine_error.startswith("action_argument_validation_failed"):
+            return "engine_or_protocol_parsing_error"
+        arguments = attempted.arguments if attempted is not None else {}
+        if expected_responder in {"select_place", "select_position"}:
+            return "invalid_position_or_place"
+        if expected_responder in {"select_sum", "select_tribute"}:
+            return "invalid_material_selection"
+        if expected_responder in {"select_card", "select_unselect_card", "select_card_codes"}:
+            return "invalid_target"
+        if any(key in arguments for key in ("index", "indices")):
+            return "invalid_index"
+        return "rule_or_timing_violation"
+    if engine_rejection_error or engine_error:
+        return "rule_or_timing_violation"
+    if terminal_model_failure:
+        return "unclassified_invalid_action"
+    if protocol_errors or agent_error:
+        return "engine_or_protocol_parsing_error"
+    return None
+
+
+def _manifest(config: ExperimentConfig, game_dir: Path, agents: tuple[Any, Any]) -> dict[str, Any]:
     deck_root = PROJECT_ROOT / "resources" / "decks"
     prompt_root = PROJECT_ROOT / "ygobench" / "agents" / "prompts"
     upstream = PROJECT_ROOT / "vendor" / "yugi-bench"
+    prompt_hashes = {path.name: _file_hash(path) for path in sorted(prompt_root.glob("*.md"))}
+    policy_identities = []
+    for agent_id, agent in zip((config.agent1, config.agent2), agents, strict=True):
+        descriptor = policy_descriptor(
+            agent_id,
+            prompt_hashes=prompt_hashes,
+            runtime=getattr(agent, "provider_config", None),
+        )
+        policy_identities.append(
+            {
+                "policy_id": policy_id(descriptor),
+                "model_configuration_id": model_configuration_id(descriptor),
+                "configuration": descriptor,
+            }
+        )
     return {
         "schema_version": config.schema_version,
         "created_at": datetime.now(UTC).isoformat(),
         "config": config.to_dict(),
         "config_hash": config.hash(),
+        "policy_identities": policy_identities,
         "paths": {"game_dir": str(game_dir)},
         "provenance": {
             "ygobench_commit": _git_commit(PROJECT_ROOT),
@@ -154,9 +224,7 @@ def _manifest(config: ExperimentConfig, game_dir: Path) -> dict[str, Any]:
                 config.deck1: _file_hash(deck_root / f"{config.deck1}.ydk"),
                 config.deck2: _file_hash(deck_root / f"{config.deck2}.ydk"),
             },
-            "prompt_hashes": {
-                path.name: _file_hash(path) for path in sorted(prompt_root.glob("*.md"))
-            },
+            "prompt_hashes": prompt_hashes,
         },
         "checkpoint_mode": "deterministic_action_prefix_replay",
         "native_engine_serialization": False,
@@ -190,6 +258,13 @@ def run_evidence_duel(
         _export_web_replay(run_dir, game_dir)
         return existing_outcome
 
+    agents = (
+        create_agent(config.agent1, seed=config.seed * 2),
+        create_agent(config.agent2, seed=config.seed * 2 + 1),
+    )
+    for agent in agents:
+        agent.reset()
+
     registry = TaskRegistry(run_dir / "task_state.sqlite")
     registry.add(config.game_id, "full_duel", config.to_dict())
     task = registry.row(config.game_id)
@@ -200,28 +275,20 @@ def run_evidence_duel(
 
     manifest_path = game_dir / "manifest.json"
     if not manifest_path.exists():
-        atomic_write_json(manifest_path, _manifest(config, game_dir))
+        atomic_write_json(manifest_path, _manifest(config, game_dir, agents))
     atomic_write_json(
         game_dir / "status.json",
         {"status": "RUNNING", "committed_decisions": len(public_rows)},
     )
 
     deck_root = PROJECT_ROOT / "resources" / "decks"
-    agents = (
-        create_agent(config.agent1, seed=config.seed * 2),
-        create_agent(config.agent2, seed=config.seed * 2 + 1),
-    )
-    for agent in agents:
-        agent.reset()
     session: DuelSession | None = None
     recent_actions: list[dict[str, Any]] = []
     termination = "decision_budget_exhausted"
     forfeit_winner: int | None = None
     started = time.perf_counter()
     interventions = interventions or {}
-    replay_rows = (
-        [*replay_prefix, *public_rows] if replay_prefix is not None else public_rows
-    )
+    replay_rows = [*replay_prefix, *public_rows] if replay_prefix is not None else public_rows
     external_prefix_totals = (
         _record_totals(replay_rows) if replay_prefix is not None else _record_totals([])
     )
@@ -328,6 +395,7 @@ def run_evidence_duel(
             exact_legal_check_performed = bool(view["legal"]["enumeration_complete"])
             validation_scope = "exact" if exact_legal_check_performed else "engine_only"
             pre_engine_error: str | None = None
+            engine_rejection_error: str | None = None
             engine_error: str | None = None
             correction_trace: dict[str, Any] | None = None
             exact_legal_match = True
@@ -341,21 +409,15 @@ def run_evidence_duel(
                 except (KeyError, TypeError, ValueError) as exc:
                     exact_legal_match = False
                     pre_engine_error = (
-                        "action_argument_validation_failed: "
-                        f"{type(exc).__name__}: {exc}"
+                        f"action_argument_validation_failed: {type(exc).__name__}: {exc}"
                     )
-            needs_model_correction = (
-                not terminal_model_failure
-                and (
-                    agent_error is not None
-                    or (exact_legal_check_performed and not exact_legal_match)
-                )
+            needs_model_correction = not terminal_model_failure and (
+                agent_error is not None or (exact_legal_check_performed and not exact_legal_match)
             )
             if needs_model_correction:
                 if pre_engine_error is None and exact_legal_check_performed:
                     pre_engine_error = (
-                        "action_not_in_exact_legal_set: "
-                        f"{executed.tool} {executed.arguments!r}"
+                        f"action_not_in_exact_legal_set: {executed.tool} {executed.arguments!r}"
                     )
                 attempted_invalid = True
                 correction_trace = {"attempts": []}
@@ -363,7 +425,9 @@ def run_evidence_duel(
                     model_action_attempts = correction_number
                     corrected: ActionChoice | None = None
                     attempt_trace: dict[str, Any]
-                    if decision_index in interventions or not hasattr(agent, "correct_invalid_action"):
+                    if decision_index in interventions or not hasattr(
+                        agent, "correct_invalid_action"
+                    ):
                         attempt_trace = {"error": "no_model_correction_available"}
                     else:
                         try:
@@ -377,18 +441,24 @@ def run_evidence_duel(
                             "trace": attempt_trace,
                         }
                     )
-                    correction_is_legal = (
-                        corrected is not None
-                        and corrected.tool == expected
-                        and (
-                            not exact_legal_check_performed
-                            or exact_legal_action_match(
-                                corrected,
-                                view["actions"],
-                                signature=session.action_signature,
+                    try:
+                        correction_is_legal = (
+                            corrected is not None
+                            and corrected.tool == expected
+                            and (
+                                not exact_legal_check_performed
+                                or exact_legal_action_match(
+                                    corrected,
+                                    view["actions"],
+                                    signature=session.action_signature,
+                                )
                             )
                         )
-                    )
+                    except (KeyError, TypeError, ValueError) as exc:
+                        correction_is_legal = False
+                        correction_trace["attempts"][-1]["validation_error"] = (
+                            f"action_argument_validation_failed: {type(exc).__name__}: {exc}"
+                        )
                     if correction_is_legal:
                         executed = corrected
                         recovery = "corrected_retry"
@@ -408,15 +478,16 @@ def run_evidence_duel(
                 try:
                     step = session.execute(executed)
                 except Exception as exc:  # noqa: BLE001
-                    engine_error = f"{type(exc).__name__}: {exc}"
+                    engine_rejection_error = f"{type(exc).__name__}: {exc}"
                     attempted_invalid = True
                     executed = _passive_fallback(session.duel.pending, session.replay_module)
                     recovery = "deterministic_fallback_after_engine_error"
                     try:
                         step = session.execute(executed)
-                        engine_error = None
                     except Exception as fallback_exc:  # noqa: BLE001
-                        engine_error = f"fallback_failed: {type(fallback_exc).__name__}: {fallback_exc}"
+                        engine_error = (
+                            f"fallback_failed: {type(fallback_exc).__name__}: {fallback_exc}"
+                        )
                         termination = "engine_rejection_abort"
                         step = None
                 after = build_oracle_state(session)
@@ -463,10 +534,24 @@ def run_evidence_duel(
                     "validation_scope": validation_scope,
                     "exact_legal_check_performed": exact_legal_check_performed,
                     "engine_submission_attempted": (
-                        pre_engine_error is None and executed is not None and not terminal_model_failure
+                        pre_engine_error is None
+                        and executed is not None
+                        and not terminal_model_failure
                     ),
                     "recovery_engine_submission_attempted": step is not None,
                     "engine_error": engine_error,
+                    "engine_rejection_error": engine_rejection_error,
+                    "primary_error_code": _decision_error_code(
+                        expected_responder=expected,
+                        attempted=attempted,
+                        trace=trace,
+                        diagnostics=diagnostics,
+                        agent_error=agent_error,
+                        pre_engine_error=pre_engine_error,
+                        engine_rejection_error=engine_rejection_error,
+                        engine_error=engine_error,
+                        terminal_model_failure=terminal_model_failure,
+                    ),
                     **diagnostics,
                 },
                 "trace": trace,
@@ -527,13 +612,11 @@ def run_evidence_duel(
         )
         final_totals = _record_totals(final_rows)
         full_decisions_by_player = [
-            int(final_totals["decisions"][seat])
-            + int(external_prefix_totals["decisions"][seat])
+            int(final_totals["decisions"][seat]) + int(external_prefix_totals["decisions"][seat])
             for seat in (0, 1)
         ]
         full_illegal = [
-            int(final_totals["illegal"][seat])
-            + int(external_prefix_totals["illegal"][seat])
+            int(final_totals["illegal"][seat]) + int(external_prefix_totals["illegal"][seat])
             for seat in (0, 1)
         ]
         outcome = {
@@ -548,6 +631,11 @@ def run_evidence_duel(
             "recovered_invalid_action": recovered_invalid_action,
             "winner": winner,
             "agents": [config.agent1, config.agent2],
+            "policy_identities": (
+                read_json(manifest_path).get("policy_identities", [])
+                if manifest_path.is_file()
+                else []
+            ),
             "decks": [config.deck1, config.deck2],
             "seed": config.seed,
             "randomization": {

@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import sys
+from collections import Counter
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -12,6 +14,11 @@ from ygobench.agents.llm_agent import compact_prompt_state
 from ygobench.agents.provider_limits import omit_reasoning_model_token_limit
 from ygobench.config import default_model_config
 from ygobench.engine.upstream import UpstreamLayout
+from ygobench.experiments.identity import (
+    model_configuration_id,
+    policy_descriptor,
+    policy_id,
+)
 from ygobench.experiments.io import JsonlJournal, content_hash
 
 _COMMITMENT_COMMANDS = {"activate", "summon", "sp_summon", "attack"}
@@ -20,11 +27,52 @@ ForecastSampling = Literal["chronological", "stratified"]
 T = TypeVar("T")
 
 
-def probe_evaluator_id(provider_name: str | None = None, model: str | None = None) -> str:
-    """Stable filesystem-safe identifier for a post-hoc probe evaluator."""
-
+def _probe_policy_descriptor(
+    provider_name: str | None = None, model: str | None = None
+) -> dict[str, Any]:
     config = default_model_config(provider=provider_name, model=model)
-    return re.sub(r"[^A-Za-z0-9._-]+", "_", f"{config.provider}__{config.model}")
+    descriptor = policy_descriptor(
+        f"react-fast:{config.provider}:{config.model}",
+        runtime={
+            "provider": config.provider,
+            "model": config.model,
+            "backend": config.backend,
+            "thinking_enabled": False,
+            "reasoning_effort": None,
+            "temperature": 0.0,
+            "max_tokens": None,
+        },
+    )
+    descriptor.update(
+        {
+            "task_profile": "post_hoc_public_state_and_forecast_v2",
+            "thinking_enabled": False,
+            "reasoning_mode": "disabled",
+            "prompt_version": "exp3-exp5-public-prefix-v2",
+            "tool_schema_version": "post-hoc-probe-tools-v2",
+            "context_policy": "public-prefix-no-hidden-state-v2",
+        }
+    )
+    return descriptor
+
+
+def probe_evaluator_id(provider_name: str | None = None, model: str | None = None) -> str:
+    """Stable path identifier covering the complete post-hoc evaluator policy."""
+    config = default_model_config(provider=provider_name, model=model)
+    readable = re.sub(r"[^A-Za-z0-9._-]+", "_", f"{config.provider}__{config.model}")
+    return f"{readable}__{policy_id(_probe_policy_descriptor(provider_name, model))}"
+
+
+def probe_evaluator_identity(
+    provider_name: str | None = None, model: str | None = None
+) -> dict[str, Any]:
+    descriptor = _probe_policy_descriptor(provider_name, model)
+    return {
+        "evaluator_id": probe_evaluator_id(provider_name, model),
+        "policy_id": policy_id(descriptor),
+        "model_configuration_id": model_configuration_id(descriptor),
+        "configuration": descriptor,
+    }
 
 
 def _provider(provider_name: str | None = None, model: str | None = None):
@@ -139,7 +187,10 @@ def _state_truth(
 def _public_zone_truth(observation: dict[str, Any]) -> dict[str, list[str]]:
     """Canonical public face-up cards, expressed from absolute player seats."""
     perspective = int(observation.get("perspective_player", 0))
-    sides = {perspective: observation.get("you", {}), 1 - perspective: observation.get("opponent", {})}
+    sides = {
+        perspective: observation.get("you", {}),
+        1 - perspective: observation.get("opponent", {}),
+    }
 
     def names(player: int, zone: str) -> list[str]:
         cards = sides[player].get(zone, []) if isinstance(sides[player], dict) else []
@@ -172,11 +223,22 @@ def _checkpoint_indices(public: list[dict[str, Any]]) -> dict[int, list[str]]:
     def add(index: int, tag: str) -> None:
         tags.setdefault(index, []).append(tag)
 
-    for fraction, tag in ((0.25, "trajectory_25"), (0.5, "trajectory_50"), (0.75, "trajectory_75"), (0.9, "trajectory_90")):
+    for fraction, tag in (
+        (0.25, "trajectory_25"),
+        (0.5, "trajectory_50"),
+        (0.75, "trajectory_75"),
+        (0.9, "trajectory_90"),
+    ):
         add(min(len(public) - 1, round(fraction * (len(public) - 1))), tag)
     special = {
-        "chain_depth_ge_2": [index for index, row in enumerate(public) if len(row.get("observation", {}).get("chain", [])) >= 2],
-        "zone_transition_heavy": [index for index, row in enumerate(public) if _zone_transition_count(row) >= 2],
+        "chain_depth_ge_2": [
+            index
+            for index, row in enumerate(public)
+            if len(row.get("observation", {}).get("chain", [])) >= 2
+        ],
+        "zone_transition_heavy": [
+            index for index, row in enumerate(public) if _zone_transition_count(row) >= 2
+        ],
         "opponent_response": [
             index
             for index, row in enumerate(public)
@@ -194,9 +256,7 @@ def _forecast_strata(observation: dict[str, Any], deck_matchup: str) -> dict[str
     you = observation.get("you", {})
     opponent = observation.get("opponent", {})
     backrow = opponent.get("spell_trap_zone", []) if isinstance(opponent, dict) else []
-    set_cards = sum(
-        bool(isinstance(card, dict) and card.get("face_down")) for card in backrow
-    )
+    set_cards = sum(bool(isinstance(card, dict) and card.get("face_down")) for card in backrow)
     opponent_hand = int(opponent.get("hand_count", 0)) if isinstance(opponent, dict) else 0
     return {
         "turn_stage": str(observation.get("phase", "unknown")),
@@ -267,22 +327,17 @@ def _evenly_spaced(items: list[T], count: int) -> list[T]:
         return list(items)
     if count == 1:
         return [items[len(items) // 2]]
-    return [
-        items[round(index * (len(items) - 1) / (count - 1))]
-        for index in range(count)
-    ]
+    return [items[round(index * (len(items) - 1) / (count - 1))] for index in range(count)]
 
 
 def _select_forecast_candidates(
-    candidates: list[dict[str, Any]], *, max_samples: int, sampling: ForecastSampling
+    candidates: list[dict[str, Any]],
+    *,
+    max_samples: int,
+    sampling: ForecastSampling,
+    seed: int = 0,
 ) -> list[dict[str, Any]]:
-    """Select forecast probes deterministically, preserving label coverage when possible.
-
-    Availability is Exp5's primary target.  Stratifying on it guarantees that a
-    run with both classes contributes both interruption and silent windows.  If
-    a completed duel naturally contains only one class, the fallback remains a
-    trajectory-spanning sample from that class; it never fabricates positives.
-    """
+    """Sample joint Availability/Behavior strata with a frozen seed."""
     if sampling == "chronological":
         return candidates[:max_samples]
     if sampling != "stratified":
@@ -292,20 +347,21 @@ def _select_forecast_candidates(
         label: [
             candidate
             for candidate in candidates
-            if candidate["availability_ground_truth"] == label
+            if (candidate["availability_ground_truth"], candidate["behavior_ground_truth"]) == label
         ]
-        for label in (0, 1)
+        for label in ((0, 0), (1, 0), (1, 1))
     }
-    present = [label for label in (1, 0) if groups[label]]
+    present = [label for label in ((1, 1), (1, 0), (0, 0)) if groups[label]]
     if not present or max_samples <= 0:
         return []
 
     quota, remainder = divmod(max_samples, len(present))
     selected: list[dict[str, Any]] = []
+    rng = random.Random(seed)
     for position, label in enumerate(present):
-        selected.extend(
-            _evenly_spaced(groups[label], quota + int(position < remainder))
-        )
+        shuffled = list(groups[label])
+        rng.shuffle(shuffled)
+        selected.extend(shuffled[: quota + int(position < remainder)])
 
     # If a small class cannot use its quota, fill from the remaining candidates
     # while retaining deterministic, whole-trajectory coverage.
@@ -314,13 +370,33 @@ def _select_forecast_candidates(
         remainder_pool = [
             candidate for candidate in candidates if candidate["sample_id"] not in selected_ids
         ]
-        selected.extend(
-            _evenly_spaced(
-                remainder_pool,
-                min(max_samples, len(candidates)) - len(selected),
-            )
-        )
+        rng.shuffle(remainder_pool)
+        selected.extend(remainder_pool[: min(max_samples, len(candidates)) - len(selected)])
     return sorted(selected, key=lambda candidate: candidate["trajectory_index"])
+
+
+def _select_across_games(samples: list[T], count: int) -> list[T]:
+    """Round-robin deterministic selection so early-sorted games cannot dominate."""
+    if count <= 0:
+        return []
+    groups: dict[str, list[T]] = {}
+    for sample in samples:
+        game_id = str(sample.get("game_id", "unknown"))  # type: ignore[union-attr]
+        groups.setdefault(game_id, []).append(sample)
+    selected: list[T] = []
+    index = 0
+    while len(selected) < min(count, len(samples)):
+        progressed = False
+        for game_id in sorted(groups):
+            if index < len(groups[game_id]):
+                selected.append(groups[game_id][index])
+                progressed = True
+                if len(selected) >= count:
+                    break
+        if not progressed:
+            break
+        index += 1
+    return selected
 
 
 def extract_probe_samples(
@@ -346,11 +422,11 @@ def extract_probe_samples(
                 "initial_public_state": _initial_public_summary(public[0]["observation"]),
                 "executed_history": [
                     {
-                    "turn": row["turn"],
-                    "phase": row["phase"],
-                    "player": row["player"],
-                    "executed_action": row["executed_action"],
-                    "engine_events": row["engine_events"],
+                        "turn": row["turn"],
+                        "phase": row["phase"],
+                        "player": row["player"],
+                        "executed_action": row["executed_action"],
+                        "engine_events": row["engine_events"],
                     }
                     for row in public[:index]
                 ],
@@ -375,7 +451,8 @@ def extract_probe_samples(
                         "historical_public_activation_count": sum(
                             1
                             for row in public[:index]
-                            if row.get("executed_action", {}).get("arguments", {}).get("command") == "activate"
+                            if row.get("executed_action", {}).get("arguments", {}).get("command")
+                            == "activate"
                         ),
                     },
                     "prefix": prefix,
@@ -429,24 +506,40 @@ def extract_probe_samples(
                     "actual_opponent_response": actual_response,
                     "availability_ground_truth": int(availability),
                     "behavior_ground_truth": int(behavior),
+                    "joint_stratum": f"A{int(availability)}B{int(behavior)}",
                     "strata": _forecast_strata(row["observation"], deck_matchup),
                 }
             )
+
+        impossible = [
+            sample
+            for sample in forecast_candidates
+            if sample["availability_ground_truth"] == 0 and sample["behavior_ground_truth"] == 1
+        ]
+        if impossible:
+            raise ValueError(f"{game_dir.name} contains logically impossible A0B1 forecast windows")
 
         selected_forecasts = _select_forecast_candidates(
             forecast_candidates,
             max_samples=max_forecasts_per_game,
             sampling=forecast_sampling,
+            seed=int(config["seed"]),
         )
+        candidate_strata = Counter(candidate["joint_stratum"] for candidate in forecast_candidates)
+        selected_strata = Counter(candidate["joint_stratum"] for candidate in selected_forecasts)
         for sample in selected_forecasts:
             sample["forecast_sampling"] = forecast_sampling
+            sample["sampling_seed"] = int(config["seed"])
+            sample["inclusion_probability"] = (
+                selected_strata[sample["joint_stratum"]] / candidate_strata[sample["joint_stratum"]]
+            )
+            sample["candidate_joint_stratum_counts"] = dict(sorted(candidate_strata.items()))
             sample["candidate_class_counts"] = {
                 "availability_positive": sum(
                     candidate["availability_ground_truth"] for candidate in forecast_candidates
                 ),
                 "availability_negative": sum(
-                    not candidate["availability_ground_truth"]
-                    for candidate in forecast_candidates
+                    not candidate["availability_ground_truth"] for candidate in forecast_candidates
                 ),
             }
             forecast_out.append(sample)
@@ -461,36 +554,54 @@ def run_probes(
     model: str | None = None,
     max_state_samples: int = 4,
     max_forecast_samples: int = 4,
+    experiments: tuple[str, ...] = ("exp3", "exp5"),
 ) -> dict[str, int]:
-    evaluator_id = probe_evaluator_id(provider_name, model)
+    unknown = set(experiments) - {"exp3", "exp5"}
+    if unknown:
+        raise ValueError(f"Unknown probe experiments: {sorted(unknown)}")
+    evaluator_identity = probe_evaluator_identity(provider_name, model)
+    evaluator_id = evaluator_identity["evaluator_id"]
     provider = _provider(provider_name, model)
-    state_samples = JsonlJournal(run_dir / "derived" / "state_probe_samples.jsonl").recover()[
-        :max_state_samples
-    ]
-    forecast_samples = JsonlJournal(run_dir / "derived" / "forecast_samples.jsonl").recover()[
-        :max_forecast_samples
-    ]
+    state_samples = (
+        _select_across_games(
+            JsonlJournal(run_dir / "derived" / "state_probe_samples.jsonl").recover(),
+            max_state_samples,
+        )
+        if "exp3" in experiments
+        else []
+    )
+    forecast_samples = (
+        _select_across_games(
+            JsonlJournal(run_dir / "derived" / "forecast_samples.jsonl").recover(),
+            max_forecast_samples,
+        )
+        if "exp5" in experiments
+        else []
+    )
     output_dir = run_dir / "derived" / "probe_results" / evaluator_id
     state_out = JsonlJournal(output_dir / "state_probe_results.jsonl")
     forecast_out = JsonlJournal(output_dir / "forecast_results.jsonl")
     state_hashes = {sample["sample_id"]: content_hash(sample) for sample in state_samples}
-    forecast_hashes = {
-        sample["sample_id"]: content_hash(sample) for sample in forecast_samples
-    }
-    retained_state = [
-        row
-        for row in state_out.recover()
-        if row.get("sample_hash") == state_hashes.get(row.get("sample_id"))
-    ]
-    retained_forecast = [
-        row
-        for row in forecast_out.recover()
-        if row.get("sample_hash") == forecast_hashes.get(row.get("sample_id"))
-    ]
-    state_out.rewrite(retained_state)
-    forecast_out.rewrite(retained_forecast)
+    forecast_hashes = {sample["sample_id"]: content_hash(sample) for sample in forecast_samples}
+    retained_state = state_out.recover()
+    retained_forecast = forecast_out.recover()
+    if "exp3" in experiments:
+        retained_state = [
+            row
+            for row in retained_state
+            if row.get("sample_hash") == state_hashes.get(row.get("sample_id"))
+        ]
+        state_out.rewrite(retained_state)
+    if "exp5" in experiments:
+        retained_forecast = [
+            row
+            for row in retained_forecast
+            if row.get("sample_hash") == forecast_hashes.get(row.get("sample_id"))
+        ]
+        forecast_out.rewrite(retained_forecast)
     completed_state = {row["sample_id"] for row in retained_state}
     completed_forecast = {row["sample_id"] for row in retained_forecast}
+
     def schema_for(value: Any) -> dict[str, Any]:
         if isinstance(value, int):
             return {"type": "integer"}
@@ -504,8 +615,7 @@ def run_probes(
         "input_schema": {
             "type": "object",
             "properties": {
-                key: schema_for(value)
-                for key, value in state_samples[0]["ground_truth"].items()
+                key: schema_for(value) for key, value in state_samples[0]["ground_truth"].items()
             }
             if state_samples
             else {},
@@ -517,8 +627,7 @@ def run_probes(
             continue
         turn = provider.respond(
             system=(
-                "Reconstruct only objectively knowable state from the supplied "
-                "full-duel prefix."
+                "Reconstruct only objectively knowable state from the supplied full-duel prefix."
             ),
             messages=[
                 {"role": "user", "content": json.dumps(sample["prefix"], ensure_ascii=False)}
@@ -526,12 +635,32 @@ def run_probes(
             tools=[state_tool],
         )
         call = next((call for call in turn.tool_calls if call.name == "report_state"), None)
+        prediction = call.arguments if call else None
+        schema_errors = []
+        if not isinstance(prediction, dict):
+            schema_errors.append("missing_or_non_object_prediction")
+        else:
+            for key, expected in sample["ground_truth"].items():
+                if key not in prediction:
+                    schema_errors.append(f"missing_field:{key}")
+                elif isinstance(expected, list) and not isinstance(prediction[key], list):
+                    schema_errors.append(f"wrong_type:{key}:array")
+                elif isinstance(expected, int) and (
+                    not isinstance(prediction[key], int) or isinstance(prediction[key], bool)
+                ):
+                    schema_errors.append(f"wrong_type:{key}:integer")
+                elif isinstance(expected, str) and not isinstance(prediction[key], str):
+                    schema_errors.append(f"wrong_type:{key}:string")
         state_out.append(
             {
                 "sample_id": sample["sample_id"],
+                "game_id": sample["game_id"],
                 "sample_hash": state_hashes[sample["sample_id"]],
+                "evaluator_identity": evaluator_identity,
                 "ground_truth": sample["ground_truth"],
-                "prediction": call.arguments if call else None,
+                "prediction": prediction,
+                "schema_valid": not schema_errors,
+                "schema_errors": schema_errors,
                 "trajectory_progress": sample["trajectory_progress"],
                 "checkpoint_tags": sample["checkpoint_tags"],
                 "state_complexity": sample["state_complexity"],
@@ -570,8 +699,10 @@ def run_probes(
             continue
         turn = provider.respond(
             system=(
-                "Estimate response availability from the acting player's visible "
-                "information only."
+                "Using only the acting player's visible information, estimate two "
+                "separate probabilities: whether the opponent objectively has a legal "
+                "response, and, conditional on such a response being available, whether "
+                "the opponent will choose to use it."
             ),
             messages=[
                 {
@@ -592,15 +723,31 @@ def run_probes(
             call.arguments.get("p_opponent_has_legal_response") if call else None
         )
         behavior_probability = call.arguments.get("p_opponent_will_respond") if call else None
+        schema_errors = []
+        for key, value in (
+            ("p_opponent_has_legal_response", availability_probability),
+            ("p_opponent_will_respond", behavior_probability),
+        ):
+            if not isinstance(value, (int, float)) or isinstance(value, bool):
+                schema_errors.append(f"missing_or_non_numeric:{key}")
+            elif not 0 <= float(value) <= 1:
+                schema_errors.append(f"out_of_range:{key}")
         forecast_out.append(
             {
                 "sample_id": sample["sample_id"],
+                "game_id": sample["game_id"],
                 "sample_hash": forecast_hashes[sample["sample_id"]],
+                "evaluator_identity": evaluator_identity,
                 "response_window_id": sample["response_window_id"],
                 "availability_ground_truth": sample["availability_ground_truth"],
                 "behavior_ground_truth": sample["behavior_ground_truth"],
                 "availability_probability": availability_probability,
                 "behavior_probability": behavior_probability,
+                "schema_valid": not schema_errors,
+                "schema_errors": schema_errors,
+                "joint_stratum": sample["joint_stratum"],
+                "inclusion_probability": sample.get("inclusion_probability"),
+                "candidate_joint_stratum_counts": sample.get("candidate_joint_stratum_counts"),
                 "strata": sample["strata"],
                 "usage": turn.usage,
                 "elapsed_seconds": turn.wallclock_seconds,

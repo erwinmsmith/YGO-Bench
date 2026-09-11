@@ -28,9 +28,8 @@ class ExperimentConfig:
     agent2: str
     seed: int
     max_decisions: int = 0
-    # v1.1 permits a terminal decision record with no executed engine action
-    # when model-action retries are exhausted and the acting player forfeits.
-    schema_version: str = "1.1.0"
+    # The schema version changes only when persisted evidence compatibility changes.
+    schema_version: str = "2.0.0"
     checkpoint_interval: int = 25
     resume: bool = True
 
@@ -56,6 +55,10 @@ class ExperimentConfig:
             "agent1": agent1,
             "agent2": agent2,
             "seed": seed,
+            "max_decisions": max_decisions,
+            "checkpoint_interval": checkpoint_interval,
+            "resume": resume,
+            "schema_version": cls.__dataclass_fields__["schema_version"].default,
         }
         return cls(
             run_id=run_id,

@@ -5,20 +5,112 @@ from __future__ import annotations
 import random
 from collections import Counter
 from pathlib import Path
-from statistics import median
 from typing import Any
 
 from ygobench.config import PROJECT_ROOT
 from ygobench.engine.protocol import ActionChoice
-from ygobench.experiments.config import ExperimentConfig, stable_id
+from ygobench.experiments.config import stable_id
 from ygobench.experiments.io import JsonlJournal, atomic_write_json, content_hash, read_json
 from ygobench.experiments.legal import exact_legal_action_match
 from ygobench.experiments.oracle import build_oracle_state
-from ygobench.experiments.runner import run_evidence_duel
+from ygobench.experiments.provenance import metric_provenance
 from ygobench.experiments.session import DuelSession
+from ygobench.experiments.statistics import cluster_bootstrap, kaplan_meier
 
 _COMMITMENT_COMMANDS = {"activate", "summon", "sp_summon", "attack"}
 _NEW_DECISION_BOUNDARIES = {"select_idlecmd", "select_battlecmd", "rock_paper_scissors"}
+
+
+def _survival_observation(result: dict[str, Any], *, default_horizon: int | None) -> dict[str, Any]:
+    """Normalize current and legacy Exp6 records into event/censor rows."""
+    survival = result["action_sequence_survival"]
+    survived = int(survival.get("survived_actions", 0))
+    failure = survival.get("first_failure")
+    if failure is not None:
+        return {
+            "time": int(survival.get("event_time", survived + 1)),
+            "event_observed": True,
+            "censor_reason": None,
+        }
+    horizon = survival.get("horizon", default_horizon)
+    censor_reason = survival.get("censor_reason")
+    if censor_reason is None:
+        censor_reason = (
+            "horizon_reached"
+            if horizon is not None and survived >= int(horizon)
+            else "trajectory_exhausted"
+        )
+    return {
+        "time": int(survival.get("censor_time", survived)),
+        "event_observed": False,
+        "censor_reason": censor_reason,
+    }
+
+
+def kaplan_meier_action_survival(
+    results: list[dict[str, Any]], *, horizon: int | None
+) -> dict[str, Any]:
+    observations = [_survival_observation(result, default_horizon=horizon) for result in results]
+    analysis = kaplan_meier(observations, horizon=horizon)
+    censor_reasons = Counter(
+        row["censor_reason"] for row in observations if not row["event_observed"]
+    )
+    analysis["time_unit"] = "subsequent_logged_actions"
+    analysis["censor_reasons"] = dict(sorted(censor_reasons.items()))
+    return analysis
+
+
+def _survival_analyses(completed: list[dict[str, Any]], *, horizon: int | None) -> dict[str, Any]:
+    changed = [row for row in completed if bool(row.get("state_changed"))]
+    return {
+        "method": "Kaplan-Meier with Greenwood pointwise confidence intervals",
+        "primary_population": "completed candidates with state_changed=true",
+        "primary": kaplan_meier_action_survival(changed, horizon=horizon),
+        "sensitivity_all_completed": kaplan_meier_action_survival(completed, horizon=horizon),
+    }
+
+
+def _failure_reason_summary(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    reasons = Counter(
+        row["action_sequence_survival"]["first_failure"]["reason"]
+        for row in results
+        if row.get("action_sequence_survival", {}).get("first_failure")
+    )
+    events = sum(reasons.values())
+    return [
+        {
+            "reason": reason,
+            "count": count,
+            "proportion_of_completed_candidates": count / len(results) if results else None,
+            "proportion_of_events": count / events if events else None,
+        }
+        for reason, count in sorted(reasons.items())
+    ]
+
+
+def _survival_cluster_bootstrap(
+    results: list[dict[str, Any]], *, horizon: int | None
+) -> dict[str, Any]:
+    changed = [row for row in results if row.get("state_changed") and row.get("game_id")]
+
+    def survival_at_horizon(sampled: list[dict[str, Any]]) -> float | None:
+        analysis = kaplan_meier_action_survival(sampled, horizon=horizon)
+        fixed = analysis.get("fixed_window") or {}
+        return fixed.get("survival_probability", {}).get("estimate")
+
+    def rmst_at_horizon(sampled: list[dict[str, Any]]) -> float | None:
+        analysis = kaplan_meier_action_survival(sampled, horizon=horizon)
+        return (analysis.get("rmst") or {}).get("estimate")
+
+    return {
+        "cluster": "duel",
+        "survival_at_horizon": cluster_bootstrap(
+            changed, cluster_key="game_id", statistic=survival_at_horizon
+        ),
+        "rmst_at_horizon": cluster_bootstrap(
+            changed, cluster_key="game_id", statistic=rmst_at_horizon
+        ),
+    }
 
 
 def _response_window_after(
@@ -154,9 +246,7 @@ def _replay_prefix(
     return recent_actions
 
 
-def _counterfactual_action_summary(
-    row: dict[str, Any], action: ActionChoice
-) -> dict[str, Any]:
+def _counterfactual_action_summary(row: dict[str, Any], action: ActionChoice) -> dict[str, Any]:
     return {
         "decision_id": row["decision_id"],
         "action_id": row["action_id"],
@@ -243,6 +333,7 @@ def _audit_candidate(
 
         survived_actions = 0
         first_failure: dict[str, Any] | None = None
+        available_follow_up = max(0, len(rows) - response_index - 1)
         for row in rows[response_index + 1 : response_index + 1 + horizon]:
             reason = _try_clean_action(counterfactual_session, counterfactual_recent, row)
             if reason is not None:
@@ -254,8 +345,12 @@ def _audit_candidate(
                 }
                 break
             survived_actions += 1
-        checked_all_available_actions = response_index + 1 + survived_actions >= len(rows)
-        right_censored = first_failure is None and not checked_all_available_actions
+        event_observed = first_failure is not None
+        censor_reason = None
+        if not event_observed:
+            censor_reason = (
+                "trajectory_exhausted" if available_follow_up <= horizon else "horizon_reached"
+            )
         return {
             "candidate": candidate,
             "status": "COMPLETED",
@@ -266,7 +361,11 @@ def _audit_candidate(
                 "horizon": horizon,
                 "survived_actions": survived_actions,
                 "first_failure": first_failure,
-                "right_censored": right_censored,
+                "event_observed": event_observed,
+                "event_time": survived_actions + 1 if event_observed else None,
+                "right_censored": not event_observed,
+                "censor_time": survived_actions if not event_observed else None,
+                "censor_reason": censor_reason,
             },
         }
     finally:
@@ -277,7 +376,7 @@ def _audit_candidate(
 def run_offline_counterfactual_audit(
     game_dir: Path, *, sample_size: int = 10, horizon: int = 32
 ) -> dict[str, Any]:
-    """Run the redesigned Exp6 without LLM calls or continuation duels."""
+    """Run Exp6 without LLM calls, resuming after each completed candidate."""
     if sample_size <= 0:
         raise ValueError("sample_size must be positive")
     if horizon <= 0:
@@ -291,17 +390,57 @@ def run_offline_counterfactual_audit(
         random.Random(int(config["seed"])).sample(candidates, min(sample_size, len(candidates))),
         key=lambda candidate: (candidate["response_index"], candidate["candidate_id"]),
     )
-    results = [_audit_candidate(config, rows, candidate, horizon) for candidate in selected]
+    audit_id = content_hash(
+        {
+            "protocol": "offline_legal_counterfactual_plan_robustness",
+            "game_id": config["game_id"],
+            "seed": int(config["seed"]),
+            "horizon": horizon,
+            "candidate_ids": [candidate["candidate_id"] for candidate in selected],
+        }
+    )
+    journal = JsonlJournal(game_dir / "exp6_offline_results.jsonl")
+    completed_by_candidate = {
+        str(record["candidate_id"]): record["result"]
+        for record in journal.recover()
+        if record.get("audit_id") == audit_id
+        and isinstance(record.get("candidate_id"), str)
+        and isinstance(record.get("result"), dict)
+        and record["result"].get("status") == "COMPLETED"
+    }
+    resumed_candidates = len(completed_by_candidate)
+    for candidate in selected:
+        candidate_id = str(candidate["candidate_id"])
+        if candidate_id in completed_by_candidate:
+            continue
+        result = _audit_candidate(config, rows, candidate, horizon)
+        journal.append(
+            {
+                "schema_version": "2.0.0",
+                "audit_id": audit_id,
+                "candidate_id": candidate_id,
+                "result": result,
+            }
+        )
+        completed_by_candidate[candidate_id] = result
+    results = [completed_by_candidate[str(candidate["candidate_id"])] for candidate in selected]
     report = {
+        "schema_version": "2.0.0",
         "phase": 4,
         "mode": "offline_legal_counterfactual_plan_robustness",
         "status": "COMPLETED" if results else "INELIGIBLE",
         "reason": None if results else "no strict legal opponent-interruption alternatives",
         "selection": {
+            "audit_id": audit_id,
             "seed": int(config["seed"]),
             "sample_size_requested": sample_size,
             "sample_size_selected": len(selected),
             "action_sequence_horizon": horizon,
+        },
+        "resume": {
+            "journal": "exp6_offline_results.jsonl",
+            "candidates_reused": resumed_candidates,
+            "candidates_computed": len(results) - resumed_candidates,
         },
         "candidate_inventory": found,
         "results": results,
@@ -317,17 +456,18 @@ def write_offline_exp6_metrics(
     reversibility: dict[str, Any],
     audit: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    """Write Exp6-R descriptive metrics; no full-duel recovery claims are made."""
+    """Write censor-aware Exp6-R survival metrics; no LLM calls are made."""
     results = audit.get("results", []) if audit else []
     completed = [row for row in results if row.get("status") == "COMPLETED"]
-    survivals = [row["action_sequence_survival"]["survived_actions"] for row in completed]
     failures = [
         row["action_sequence_survival"]["first_failure"]
         for row in completed
         if row["action_sequence_survival"]["first_failure"] is not None
     ]
     failure_reasons = Counter(row["reason"] for row in failures)
+    horizon = audit.get("selection", {}).get("action_sequence_horizon") if audit else None
     metrics = {
+        "schema_version": "2.0.0",
         "experiment": 6,
         "mode": "offline_legal_counterfactual_plan_robustness",
         "status": audit.get("status", "SKIPPED") if audit else "SKIPPED",
@@ -338,25 +478,11 @@ def write_offline_exp6_metrics(
         "candidate_inventory": audit.get("candidate_inventory") if audit else None,
         "sampled_counterfactuals": len(completed),
         "state_changed_rate": (
-            sum(row["state_changed"] for row in completed) / len(completed)
-            if completed
-            else None
+            sum(row["state_changed"] for row in completed) / len(completed) if completed else None
         ),
-        "horizon_plan_invalidation_rate": {
-            "numerator": len(failures),
-            "denominator": len(completed),
-            "estimate": len(failures) / len(completed) if completed else None,
-            "direction": "lower_is_better",
-        },
-        "action_sequence_survival": {
-            "median_steps": median(survivals) if survivals else None,
-            "mean_steps": sum(survivals) / len(survivals) if survivals else None,
-            "right_censored": sum(
-                row["action_sequence_survival"]["right_censored"] for row in completed
-            ),
-            "horizon": audit.get("selection", {}).get("action_sequence_horizon") if audit else None,
-        },
+        "action_sequence_survival": _survival_analyses(completed, horizon=horizon),
         "first_failure_reasons": dict(sorted(failure_reasons.items())),
+        "first_failure_reason_summary": _failure_reason_summary(completed),
         "ineligibility_reason": audit.get("reason") if audit else "reversibility gate failed",
         "full_duel_continuations": 0,
         "llm_calls": 0,
@@ -374,6 +500,7 @@ def aggregate_offline_exp6_metrics(run_dir: Path) -> dict[str, Any]:
     """
     per_game: list[dict[str, Any]] = []
     completed: list[dict[str, Any]] = []
+    completed_by_model: dict[str, list[dict[str, Any]]] = {}
     failure_reasons: Counter[str] = Counter()
     commitment_points = eligible_counterfactuals = 0
     missing_reports: list[str] = []
@@ -396,14 +523,28 @@ def aggregate_offline_exp6_metrics(run_dir: Path) -> dict[str, Any]:
             continue
 
         inventory = audit.get("candidate_inventory", {})
+        manifest = read_json(game_dir / "manifest.json", {})
+        policy_identities = manifest.get("policy_identities", [])
         commitment_points += int(inventory.get("commitment_points", 0))
         eligible_counterfactuals += int(inventory.get("eligible_counterfactuals", 0))
         game_completed = [
-            result
-            for result in audit.get("results", [])
-            if result.get("status") == "COMPLETED"
+            result for result in audit.get("results", []) if result.get("status") == "COMPLETED"
         ]
-        completed.extend(game_completed)
+        for result in game_completed:
+            focal_player = int(result.get("candidate", {}).get("focal_player", 0))
+            identity = (
+                policy_identities[focal_player] if focal_player < len(policy_identities) else {}
+            )
+            enriched = {
+                **result,
+                "game_id": game_id,
+                "policy_id": identity.get("policy_id"),
+                "model_configuration_id": identity.get(
+                    "model_configuration_id", identity.get("policy_id", "legacy_unknown")
+                ),
+            }
+            completed.append(enriched)
+            completed_by_model.setdefault(enriched["model_configuration_id"], []).append(enriched)
         failures = [
             result["action_sequence_survival"]["first_failure"]
             for result in game_completed
@@ -422,15 +563,14 @@ def aggregate_offline_exp6_metrics(run_dir: Path) -> dict[str, Any]:
             }
         )
 
-    survivals = [
-        result["action_sequence_survival"]["survived_actions"] for result in completed
-    ]
-    failures = [
-        result
+    horizons = {
+        int(result["action_sequence_survival"]["horizon"])
         for result in completed
-        if result["action_sequence_survival"].get("first_failure") is not None
-    ]
+        if result["action_sequence_survival"].get("horizon") is not None
+    }
+    horizon = min(horizons) if horizons else None
     metrics = {
+        "schema_version": "2.0.0",
         "experiment": 6,
         "mode": "offline_legal_counterfactual_plan_robustness",
         "status": "COMPLETED" if not missing_reports else "PARTIAL",
@@ -450,172 +590,34 @@ def aggregate_offline_exp6_metrics(run_dir: Path) -> dict[str, Any]:
             if completed
             else None
         ),
-        "horizon_plan_invalidation_rate": {
-            "numerator": len(failures),
-            "denominator": len(completed),
-            "estimate": len(failures) / len(completed) if completed else None,
-            "direction": "lower_is_better",
-        },
-        "action_sequence_survival": {
-            "median_steps": median(survivals) if survivals else None,
-            "mean_steps": sum(survivals) / len(survivals) if survivals else None,
-            "right_censored": sum(
-                result["action_sequence_survival"]["right_censored"]
-                for result in completed
-            ),
-        },
+        "action_sequence_survival": _survival_analyses(completed, horizon=horizon),
+        "cluster_bootstrap": _survival_cluster_bootstrap(completed, horizon=horizon),
+        "by_model_configuration": [
+            {
+                "model_configuration_id": model_configuration,
+                "sampled_counterfactuals": len(model_results),
+                "state_changed": sum(bool(row.get("state_changed")) for row in model_results),
+                "action_sequence_survival": _survival_analyses(model_results, horizon=horizon),
+                "first_failure_reasons": dict(
+                    sorted(
+                        Counter(
+                            row["action_sequence_survival"]["first_failure"]["reason"]
+                            for row in model_results
+                            if row["action_sequence_survival"].get("first_failure")
+                        ).items()
+                    )
+                ),
+                "first_failure_reason_summary": _failure_reason_summary(model_results),
+                "cluster_bootstrap": _survival_cluster_bootstrap(model_results, horizon=horizon),
+            }
+            for model_configuration, model_results in sorted(completed_by_model.items())
+        ],
         "first_failure_reasons": dict(sorted(failure_reasons.items())),
+        "first_failure_reason_summary": _failure_reason_summary(completed),
         "full_duel_continuations": 0,
         "llm_calls": 0,
         "per_game": per_game,
-    }
-    atomic_write_json(run_dir / "metrics" / "exp6" / "metrics.json", metrics)
-    return metrics
-
-
-def find_interruption_candidate(game_dir: Path) -> dict[str, Any] | None:
-    rows = JsonlJournal(game_dir / "trajectory.jsonl").recover()
-    for index, row in enumerate(rows):
-        legal = row.get("legal", {})
-        if legal.get("expected_responder") != "select_chain" or not legal.get(
-            "enumeration_complete"
-        ):
-            continue
-        alternatives = [
-            action
-            for action in legal.get("actions", [])
-            if action.get("arguments", {}).get("index") is not None
-            and action != row.get("executed_action")
-        ]
-        if alternatives:
-            return {
-                "decision_index": index,
-                "decision_id": row["decision_id"],
-                "original_action": row["executed_action"],
-                "interruption_action": alternatives[0],
-                "interruption_player": int(row["player"]),
-                "focal_player": 1 - int(row["player"]),
-            }
-    return None
-
-
-def run_interruption_branch(game_dir: Path, *, root: Path) -> dict[str, Any]:
-    manifest = read_json(game_dir / "manifest.json")
-    parent = manifest["config"]
-    rows = JsonlJournal(game_dir / "trajectory.jsonl").recover()
-    candidate = find_interruption_candidate(game_dir)
-    if candidate is None:
-        report = {
-            "phase": 4,
-            "status": "INELIGIBLE",
-            "reason": "no exact legal alternative select_chain interruption in the trajectory",
-        }
-        atomic_write_json(game_dir / "exp6_branch_report.json", report)
-        return report
-    branch_run = f"{parent['run_id']}_exp6"
-    branch_game = stable_id(
-        "branch", [parent["game_id"], candidate["decision_id"], "legal_interruption"]
-    )
-    config = ExperimentConfig.build(
-        run_id=branch_run,
-        game_id=branch_game,
-        deck1=parent["deck1"],
-        deck2=parent["deck2"],
-        agent1=parent["agent1"],
-        agent2=parent["agent2"],
-        seed=int(parent["seed"]),
-        max_decisions=int(parent["max_decisions"]),
-        checkpoint_interval=int(parent.get("checkpoint_interval", 25)),
-    )
-    index = int(candidate["decision_index"])
-    outcome = run_evidence_duel(
-        config,
-        root=root,
-        replay_prefix=rows[:index],
-        interventions={index: ActionChoice(**candidate["interruption_action"])},
-    )
-    report = {
-        "phase": 4,
-        "status": "COMPLETED",
-        "parent_game_id": parent["game_id"],
-        "branch_game_id": branch_game,
-        "candidate": candidate,
-        "clean_winner": read_json(game_dir / "outcome.json").get("winner"),
-        "interrupted_winner": outcome.get("winner"),
-        "branch_outcome": outcome,
-    }
-    atomic_write_json(game_dir / "exp6_branch_report.json", report)
-    return report
-
-
-def write_exp6_metrics(
-    run_dir: Path,
-    game_dir: Path,
-    *,
-    reversibility: dict[str, Any],
-    branch: dict[str, Any] | None,
-) -> dict[str, Any]:
-    clean = read_json(game_dir / "outcome.json")
-    branch = branch or {
-        "status": "SKIPPED",
-        "reason": "branch was not run",
-    }
-    interrupted = branch.get("branch_outcome", {})
-    focal_player = branch.get("candidate", {}).get("focal_player")
-    clean_win = focal_player is not None and clean.get("winner") == focal_player
-    recovered = clean_win and interrupted.get("winner") == focal_player
-
-    def total(outcome: dict[str, Any], key: str) -> int:
-        return sum(outcome.get("model_usage_totals", {}).get(key, [0, 0]))
-
-    paired_completed = branch.get("status") == "COMPLETED"
-    recovery_costs = (
-        {
-            "additional_decisions": (
-                interrupted.get("decisions", 0) - clean.get("decisions", 0)
-            ),
-            "additional_model_calls": total(interrupted, "model_calls")
-            - total(clean, "model_calls"),
-            "additional_input_tokens": total(interrupted, "input_tokens")
-            - total(clean, "input_tokens"),
-            "additional_output_tokens": total(interrupted, "output_tokens")
-            - total(clean, "output_tokens"),
-            "additional_decision_latency_seconds": round(
-                sum(interrupted.get("decision_seconds", [0, 0]))
-                - sum(clean.get("decision_seconds", [0, 0])),
-                6,
-            ),
-        }
-        if paired_completed
-        else None
-    )
-    metrics = {
-        "experiment": 6,
-        "status": branch.get("status"),
-        "reversibility_gate": {
-            "passed": bool(reversibility.get("passed")),
-            "sample_size": int(reversibility.get("sample_size", 0)),
-        },
-        "paired_branches": int(paired_completed),
-        "plan_recovery_rate": {
-            "metric": "plan_recovery_rate",
-            "numerator": int(recovered),
-            "denominator": int(clean_win),
-            "estimate": float(recovered) if clean_win else None,
-            "direction": "higher_is_better",
-        },
-        "clean": {
-            "game_over": clean.get("game_over"),
-            "winner": clean.get("winner"),
-            "decisions": clean.get("decisions"),
-        },
-        "interrupted": {
-            "game_over": interrupted.get("game_over"),
-            "winner": interrupted.get("winner"),
-            "decisions": interrupted.get("decisions"),
-        },
-        "recovery_costs": recovery_costs,
-        "ineligibility_reason": branch.get("reason"),
+        "provenance": metric_provenance(run_dir),
     }
     atomic_write_json(run_dir / "metrics" / "exp6" / "metrics.json", metrics)
     return metrics
