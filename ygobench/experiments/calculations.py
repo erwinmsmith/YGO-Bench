@@ -43,7 +43,21 @@ def _validation_invalid(row: dict[str, Any]) -> bool:
 
 
 def _tool_calls(row: dict[str, Any]) -> int:
-    return sum(len(turn.get("tool_calls", [])) for turn in row.get("trace", {}).get("turns", []))
+    count = sum(
+        len(turn.get("tool_calls", [])) for turn in row.get("trace", {}).get("turns", [])
+    )
+    for attempt in (row.get("correction_trace") or {}).get("attempts", []):
+        count += len((attempt.get("trace") or {}).get("tool_calls", []))
+    return count
+
+
+def _model_calls(row: dict[str, Any]) -> int:
+    count = len(row.get("trace", {}).get("turns", []))
+    count += sum(
+        isinstance((attempt.get("trace") or {}).get("usage"), dict)
+        for attempt in (row.get("correction_trace") or {}).get("attempts", [])
+    )
+    return count
 
 
 def _pair_cluster_id(outcome: dict[str, Any]) -> str:
@@ -721,9 +735,9 @@ def execution_metrics(
             bool(validation.get("engine_rejection_error") or validation.get("engine_error"))
         )
         item["tool_calls"] += _tool_calls(row)
-        item["model_calls"] += len(row.get("trace", {}).get("turns", []))
+        item["model_calls"] += _model_calls(row)
         item["inspect_card_calls"] += sum(
-            call.get("name") == "inspect_card"
+            call.get("name") in {"inspect_card", "inspect_cards"}
             for turn in row.get("trace", {}).get("turns", [])
             for call in turn.get("tool_calls", [])
         )

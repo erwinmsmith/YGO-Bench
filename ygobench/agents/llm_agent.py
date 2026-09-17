@@ -11,7 +11,10 @@ from typing import Any
 
 from ygobench.agents.base import BaseAgent
 from ygobench.agents.provider_limits import (
+    force_deepseek_thinking_mode,
+    force_qwen_thinking_mode,
     force_single_tool_call,
+    omit_provider_token_limit,
     omit_reasoning_model_token_limit,
     scrub_reasoning_content,
 )
@@ -27,6 +30,16 @@ PROMPT_ROOT = Path(__file__).parent / "prompts"
 MAX_PROVIDER_CONNECTION_ATTEMPTS = 3
 CONNECTION_RETRY_DELAYS_SECONDS = (10.0, 10.0)
 MAX_MODEL_ACTION_ATTEMPTS = 3
+MAX_INSPECTION_ROUNDS = 1
+
+INPUT_TOKEN_STAGES = (
+    "initial_decision",
+    "card_inspection",
+    "action_protocol_correction",
+    "illegal_action_correction",
+)
+
+CACHED_CARD_FIELDS = ("code", "name", "description")
 
 
 def _provider_runtime():
@@ -137,12 +150,123 @@ def exact_legal_actions_packet(decision: DecisionRequest) -> str:
     )
 
 
+def _inspect_cards_tool() -> dict[str, Any]:
+    """Return the v3 batch-inspection schema used by full-duel agents."""
+
+    return {
+        "name": "inspect_cards",
+        "description": (
+            "Batch lookup visible cards by card passcode. This tool may be called in "
+            "at most one inspection round for the current engine decision. Put every "
+            "visible card whose oracle text you need in card_ids. After the results are "
+            "returned, the next response must call the required game-action tool."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "card_ids": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "minItems": 1,
+                    "uniqueItems": True,
+                    "description": "Visible card passcodes to inspect in this one batch.",
+                }
+            },
+            "required": ["card_ids"],
+        },
+    }
+
+
+def _select_place_tool() -> dict[str, Any]:
+    """Return the semantic v2 zone schema independent of vendor revisions."""
+
+    return {
+        "name": "select_place",
+        "description": (
+            "Choose exactly the requested number of zones. Copy semantic location "
+            "names from the pending decision; never send numeric OCG constants."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "places": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "player": {"type": "integer", "enum": [0, 1]},
+                            "location": {
+                                "type": "string",
+                                "enum": [
+                                    "monster_zone",
+                                    "spell_zone",
+                                    "pendulum_zone",
+                                ],
+                            },
+                            "sequence": {"type": "integer", "minimum": 0},
+                        },
+                        "required": ["player", "location", "sequence"],
+                    },
+                    "minItems": 1,
+                }
+            },
+            "required": ["places"],
+        },
+    }
+
+
+def _input_token_breakdown(turns: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate provider input usage by request stage for one model decision."""
+
+    stages = {
+        stage: {"model_calls": 0, "input_tokens": 0} for stage in INPUT_TOKEN_STAGES
+    }
+    stages["legacy_unclassified"] = {"model_calls": 0, "input_tokens": 0}
+    for turn in turns:
+        stage = str(turn.get("request_stage") or "legacy_unclassified")
+        bucket = stages.setdefault(stage, {"model_calls": 0, "input_tokens": 0})
+        bucket["model_calls"] += 1
+        value = (turn.get("usage") or {}).get("input_tokens", 0)
+        if isinstance(value, (int, float)):
+            bucket["input_tokens"] += int(value)
+    return {
+        "stages": stages,
+        "model_calls": sum(value["model_calls"] for value in stages.values()),
+        "input_tokens": sum(value["input_tokens"] for value in stages.values()),
+    }
+
+
+def _static_card_knowledge(card: dict[str, Any]) -> dict[str, Any]:
+    """Keep only immutable printed-card knowledge for cross-decision reuse."""
+
+    return {key: card[key] for key in CACHED_CARD_FIELDS if card.get(key) is not None}
+
+
+def _card_cache_packet(cache: dict[int, dict[str, Any]]) -> str:
+    """Render previously inspected card text without stale duel-state fields."""
+
+    if not cache:
+        return ""
+    cards = [cache[code] for code in sorted(cache)]
+    return (
+        "\n\n## Duel-level inspected card cache\n"
+        "These immutable card texts were inspected earlier in this same duel. Reuse "
+        "them directly and do not call inspect_cards for these card_ids again. Current "
+        "zone, position, and modified stats must still be read from the state above.\n\n"
+        "```json\n"
+        + json.dumps(cards, ensure_ascii=False, indent=2, default=str)
+        + "\n```"
+    )
+
+
 class ProviderProtocolError(RuntimeError):
     """Raised locally when a tool-call transcript is not API-valid."""
 
     def __init__(self, diagnostics: dict[str, Any]) -> None:
         self.diagnostics = diagnostics
-        super().__init__("invalid_tool_message_transcript: " + json.dumps(diagnostics, sort_keys=True))
+        super().__init__(
+            "invalid_tool_message_transcript: " + json.dumps(diagnostics, sort_keys=True)
+        )
 
 
 class ProviderCallError(RuntimeError):
@@ -205,7 +329,6 @@ class LLMFullDuelAgent(BaseAgent):
         *,
         max_tokens: int | None = None,
         temperature: float = 0.0,
-        max_inspections: int = 8,
         max_forced_retries: int = MAX_MODEL_ACTION_ATTEMPTS - 1,
         thinking_enabled: bool = True,
         profile: str = "react",
@@ -219,21 +342,35 @@ class LLMFullDuelAgent(BaseAgent):
         if model.api_key:
             kwargs["api_key"] = model.api_key
         backend = model.backend or model.provider
-        if backend == "openai" and model.base_url:
-            kwargs["extra_body"] = {"enable_thinking": thinking_enabled}
+        qwen_compatible = model.provider in {"bailian", "dashscope"}
+        if backend == "dashscope":
+            # The Qwen provider sends this value as enable_thinking on every
+            # request; do not let its constructor default disagree with the
+            # experiment's recorded thinking profile.
+            kwargs["thinking_enabled"] = thinking_enabled
         self._provider = get_provider(backend, model.model, **kwargs)
         if backend in {"deepseek", "dashscope"} and max_tokens is None:
             omit_reasoning_model_token_limit(self._provider)
+        if qwen_compatible and max_tokens is None:
+            omit_provider_token_limit(self._provider)
         # DashScope's documented compatible-mode example does not expose this
         # optional OpenAI flag.  Prompt/schema validation enforce one action,
         # while avoiding a provider-specific unsupported request parameter.
-        if backend != "dashscope":
+        if backend != "dashscope" and not qwen_compatible:
             force_single_tool_call(self._provider)
         if backend in {"deepseek", "dashscope"} and not thinking_enabled:
             self._provider.reasoning_effort = None
             self._provider.thinking_enabled = False
+        if backend == "deepseek":
+            force_deepseek_thinking_mode(self._provider, enabled=thinking_enabled)
+        if qwen_compatible:
+            force_qwen_thinking_mode(self._provider, enabled=thinking_enabled)
         self._tool_defs = {tool["name"]: tool for tool in tools_module.TOOLS}
-        self._max_inspections = max_inspections
+        # Full-duel tool protocol v3 replaces repeated single-card lookups with
+        # exactly one batch-inspection round per engine decision.
+        self._tool_defs["inspect_cards"] = _inspect_cards_tool()
+        self._tool_defs["select_place"] = _select_place_tool()
+        self._max_inspection_rounds = MAX_INSPECTION_ROUNDS
         self._max_forced_retries = max_forced_retries
         self._max_provider_connection_attempts = MAX_PROVIDER_CONNECTION_ATTEMPTS
         self._system_prompt = (PROMPT_ROOT / "full_duel_system.md").read_text()
@@ -246,12 +383,14 @@ class LLMFullDuelAgent(BaseAgent):
         self.model_calls = 0
         self.invalid_outputs = 0
         self.last_trace: dict[str, Any] = {}
+        self._inspected_card_cache: dict[int, dict[str, Any]] = {}
 
     def reset(self) -> None:
         self.usage = {}
         self.model_calls = 0
         self.invalid_outputs = 0
         self.last_trace = {}
+        self._inspected_card_cache = {}
 
     def _accumulate(self, usage: dict[str, Any], elapsed: float) -> None:
         self.model_calls += 1
@@ -322,6 +461,13 @@ class LLMFullDuelAgent(BaseAgent):
                 label="automatic / only legal response",
             )
         state = compact_prompt_state(decision.observation)
+        card_cache = getattr(self, "_inspected_card_cache", None)
+        if not isinstance(card_cache, dict):
+            card_cache = {}
+            self._inspected_card_cache = card_cache
+        cache_available_before = sorted(card_cache)
+        cache_hits: set[int] = set()
+        cache_added: set[int] = set()
         responder = str(state.get("decision", {}).get("responder", decision.decision_type))
         response_tool = self._tool_defs.get(responder)
         if response_tool is None:
@@ -339,17 +485,19 @@ class LLMFullDuelAgent(BaseAgent):
         ).replace("{{REQUIRED_RESPONDER}}", responder)
         if decision.legal_actions_complete:
             prompt += exact_legal_actions_packet(decision)
+        prompt += _card_cache_packet(card_cache)
         messages: list[dict[str, Any]] = [{"role": "user", "content": prompt}]
-        available_tools = [self._tool_defs["inspect_card"], response_tool]
+        available_tools = [self._tool_defs["inspect_cards"], response_tool]
         active_system_prompt = self._system_prompt
-        inspections = 0
+        inspection_rounds = 0
         forced_retries = 0
         traces: list[dict[str, Any]] = []
         requests: list[dict[str, Any]] = []
         transport_attempts: list[dict[str, Any]] = []
         protocol_failures: list[dict[str, Any]] = []
 
-        while inspections <= self._max_inspections:
+        request_stage = "initial_decision"
+        while True:
             turn = self._respond_once(
                 system=active_system_prompt,
                 messages=messages,
@@ -358,6 +506,7 @@ class LLMFullDuelAgent(BaseAgent):
                 transport_attempts=transport_attempts,
             )
             trace = {
+                "request_stage": request_stage,
                 "text": turn.text,
                 "tool_calls": [
                     {"id": call.id, "name": call.name, "arguments": call.arguments}
@@ -371,7 +520,11 @@ class LLMFullDuelAgent(BaseAgent):
                 "provider_data": scrub_reasoning_content(turn.provider_data),
             }
             traces.append(trace)
-            if len(turn.tool_calls) > 1:
+            inspect_calls = [call for call in turn.tool_calls if call.name == "inspect_cards"]
+            inspection_only_turn = bool(inspect_calls) and len(inspect_calls) == len(
+                turn.tool_calls
+            )
+            if len(turn.tool_calls) > 1 and not inspection_only_turn:
                 protocol_failures.append(
                     {
                         "attempt": len(traces),
@@ -382,15 +535,24 @@ class LLMFullDuelAgent(BaseAgent):
                     }
                 )
                 action_call = None
-            else:
+            elif not inspection_only_turn:
                 action_call = next(
                     (call for call in turn.tool_calls if call.name == responder), None
                 )
+            else:
+                action_call = None
             if action_call is not None:
                 self.last_trace = {
                     "requests": requests,
                     "turns": traces,
+                    "input_token_breakdown": _input_token_breakdown(traces),
                     "transport_attempts": transport_attempts,
+                    "card_cache": {
+                        "available_before": cache_available_before,
+                        "hits": sorted(cache_hits),
+                        "added": sorted(cache_added),
+                        "size_after": len(card_cache),
+                    },
                     "fallback": False,
                 }
                 return ActionChoice(
@@ -399,8 +561,7 @@ class LLMFullDuelAgent(BaseAgent):
                     label=turn.text.strip() or action_call.name,
                 )
 
-            inspect_calls = [call for call in turn.tool_calls if call.name == "inspect_card"]
-            if len(turn.tool_calls) == 1 and inspect_calls and inspections < self._max_inspections:
+            if inspection_only_turn and inspection_rounds < self._max_inspection_rounds:
                 messages.append(
                     {
                         "role": "assistant",
@@ -409,20 +570,49 @@ class LLMFullDuelAgent(BaseAgent):
                         "provider_data": turn.provider_data,
                     }
                 )
-                inspect_call = inspect_calls[0]
-                card_code = int(inspect_call.arguments.get("card_code", 0))
-                card_info = _find_card(decision.observation, card_code)
-                inspections += 1
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": inspect_call.id,
-                        "content": json.dumps(card_info, ensure_ascii=False, default=str),
-                        "is_error": card_info.get("name") is None,
+                for inspect_call in inspect_calls:
+                    raw_ids = inspect_call.arguments.get("card_ids", [])
+                    card_ids: list[int] = []
+                    if isinstance(raw_ids, list):
+                        for value in raw_ids:
+                            if isinstance(value, int) and value not in card_ids:
+                                card_ids.append(value)
+                    cards: list[dict[str, Any]] = []
+                    for code in card_ids:
+                        if code in card_cache:
+                            cache_hits.add(code)
+                            cards.append(card_cache[code])
+                            continue
+                        card = _find_card(decision.observation, code)
+                        cards.append(card)
+                        knowledge = _static_card_knowledge(card)
+                        if knowledge.get("name") is not None:
+                            card_cache[code] = knowledge
+                            cache_added.add(code)
+                    result = {
+                        "inspection_round": 1,
+                        "requested_card_ids": card_ids,
+                        "cards": cards,
+                        "cache_hits": sorted(code for code in card_ids if code in cache_hits),
+                        "cache_added": sorted(code for code in card_ids if code in cache_added),
+                        "next_required_tool": responder,
+                        "instruction": (
+                            "Inspection is complete. Your next response must submit the "
+                            "required game-action tool; no further inspection is allowed."
+                        ),
                     }
-                )
-                if inspections >= self._max_inspections:
-                    available_tools = [response_tool]
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": inspect_call.id,
+                            "content": json.dumps(result, ensure_ascii=False, default=str),
+                            "is_error": not card_ids
+                            or any(card.get("name") is None for card in cards),
+                        }
+                    )
+                inspection_rounds += 1
+                available_tools = [response_tool]
+                request_stage = "card_inspection"
                 continue
 
             if forced_retries < self._max_forced_retries:
@@ -456,6 +646,7 @@ class LLMFullDuelAgent(BaseAgent):
                         ),
                     }
                 ]
+                request_stage = "action_protocol_correction"
                 continue
             break
 
@@ -469,14 +660,23 @@ class LLMFullDuelAgent(BaseAgent):
         self.last_trace = {
             "requests": requests,
             "turns": traces,
+            "input_token_breakdown": _input_token_breakdown(traces),
             "transport_attempts": transport_attempts,
+            "card_cache": {
+                "available_before": cache_available_before,
+                "hits": sorted(cache_hits),
+                "added": sorted(cache_added),
+                "size_after": len(card_cache),
+            },
             "fallback": False,
             "terminal_model_failure": True,
             "error": diagnostics,
         }
         raise ProviderProtocolError(diagnostics)
 
-    def correct_invalid_action(self, decision: DecisionRequest) -> tuple[ActionChoice | None, dict[str, Any]]:
+    def correct_invalid_action(
+        self, decision: DecisionRequest
+    ) -> tuple[ActionChoice | None, dict[str, Any]]:
         """Request one replacement from the authoritative legal action list.
 
         This is deliberately a narrow correction call: it cannot inspect cards
@@ -513,6 +713,7 @@ class LLMFullDuelAgent(BaseAgent):
             transport_attempts=transport_attempts,
         )
         trace = {
+            "request_stage": "illegal_action_correction",
             "tool_calls": [
                 {"id": call.id, "name": call.name, "arguments": call.arguments}
                 for call in turn.tool_calls

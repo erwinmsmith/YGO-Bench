@@ -7,8 +7,8 @@ from typing import Any
 from ygobench.experiments.config import stable_id
 
 POLICY_IDENTITY_VERSION = "2.0.0"
-TOOL_SCHEMA_VERSION = "full-duel-tools-v2"
-CONTEXT_POLICY = "compact-public-state-v1"
+TOOL_SCHEMA_VERSION = "full-duel-tools-v4-batch-inspection-cache"
+CONTEXT_POLICY = "compact-public-state-with-duel-card-cache-v2"
 RETRY_POLICY = {
     "model_action_attempts": 3,
     "provider_attempts": 3,

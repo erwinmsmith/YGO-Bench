@@ -9,8 +9,15 @@ from ygobench.agents.action_space import (
     OPCODE_OR,
     _declarable,
 )
-from ygobench.agents.llm_agent import LLMFullDuelAgent, _find_card, compact_prompt_state
+from ygobench.agents.llm_agent import (
+    LLMFullDuelAgent,
+    ProviderProtocolError,
+    _find_card,
+    _select_place_tool,
+    compact_prompt_state,
+)
 from ygobench.bench.duel_metrics import summarize_duels
+from ygobench.engine.full_duel import _normalize_action
 from ygobench.engine.protocol import ActionChoice, DecisionRequest
 from ygobench.engine.visibility import sanitize_events_for_player
 
@@ -42,6 +49,30 @@ def test_llm_agent_skips_model_for_forced_response() -> None:
     action = agent.predict(request)
     assert action.arguments == {"index": None}
     assert agent.last_trace["automatic"] is True
+
+
+def test_select_place_uses_semantic_zone_names_before_engine_normalization() -> None:
+    core = SimpleNamespace(LOCATION_MZONE=4, LOCATION_SZONE=8)
+    tools = SimpleNamespace(coerce_args=lambda tool, args: {"tool": tool, **args})
+    normalized = _normalize_action(
+        ActionChoice(
+            "select_place",
+            {"places": [{"player": 0, "location": "monster_zone", "sequence": 2}]},
+        ),
+        core,
+        tools,
+    )
+    assert normalized == {
+        "tool": "select_place",
+        "places": [{"player": 0, "location": 4, "sequence": 2}],
+    }
+
+    schema = _select_place_tool()["input_schema"]
+    location = schema["properties"]["places"]["items"]["properties"]["location"]
+    assert location == {
+        "type": "string",
+        "enum": ["monster_zone", "spell_zone", "pendulum_zone"],
+    }
 
 
 def test_llm_agent_retries_length_response_with_action_only() -> None:
@@ -78,10 +109,10 @@ def test_llm_agent_retries_length_response_with_action_only() -> None:
     agent = LLMFullDuelAgent.__new__(LLMFullDuelAgent)
     agent._provider = Provider()
     agent._tool_defs = {
-        "inspect_card": {"name": "inspect_card"},
+        "inspect_cards": {"name": "inspect_cards"},
         "select_yesno": {"name": "select_yesno"},
     }
-    agent._max_inspections = 4
+    agent._max_inspection_rounds = 1
     agent._max_forced_retries = 2
     agent._system_prompt = "system"
     agent._observation_template = "{{STATE_JSON}} {{REQUIRED_RESPONDER}}"
@@ -102,6 +133,247 @@ def test_llm_agent_retries_length_response_with_action_only() -> None:
     assert action.arguments == {"accept": True}
     assert agent._provider.calls == 2
     assert agent.last_trace["fallback"] is False
+
+
+def test_llm_agent_batches_one_inspection_round_then_requires_action() -> None:
+    class Provider:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def respond(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(self.calls) == 1:
+                return SimpleNamespace(
+                    text="inspect together",
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="inspect-1",
+                            name="inspect_cards",
+                            arguments={"card_ids": [1, 99, 1]},
+                        )
+                    ],
+                    stop_reason="tool_calls",
+                    usage={"input_tokens": 100, "output_tokens": 5},
+                    wallclock_seconds=0.1,
+                    provider_data={},
+                )
+            assert [tool["name"] for tool in kwargs["tools"]] == ["select_yesno"]
+            tool_messages = [m for m in kwargs["messages"] if m["role"] == "tool"]
+            assert len(tool_messages) == 1
+            result = json.loads(tool_messages[0]["content"])
+            assert result["requested_card_ids"] == [1, 99]
+            assert [card["name"] for card in result["cards"]] == ["First", "Target"]
+            assert result["cache_hits"] == []
+            assert result["cache_added"] == [1, 99]
+            assert result["next_required_tool"] == "select_yesno"
+            return SimpleNamespace(
+                text="",
+                tool_calls=[
+                    SimpleNamespace(
+                        id="action-1",
+                        name="select_yesno",
+                        arguments={"accept": True},
+                    )
+                ],
+                stop_reason="tool_calls",
+                usage={"input_tokens": 200, "output_tokens": 7},
+                wallclock_seconds=0.1,
+                provider_data={},
+            )
+
+    agent = LLMFullDuelAgent.__new__(LLMFullDuelAgent)
+    agent._provider = Provider()
+    agent._tool_defs = {
+        "inspect_cards": {"name": "inspect_cards"},
+        "select_yesno": {"name": "select_yesno"},
+    }
+    agent._max_inspection_rounds = 1
+    agent._max_forced_retries = 2
+    agent._system_prompt = "system"
+    agent._observation_template = "{{STATE_JSON}} {{REQUIRED_RESPONDER}}"
+    agent.usage = {}
+    agent.model_calls = 0
+    agent.invalid_outputs = 0
+    agent.last_trace = {}
+    request = DecisionRequest(
+        player=0,
+        observation={
+            "decision": {"responder": "select_yesno"},
+            "you": {"hand": [{"code": 1, "name": "First"}]},
+            "opponent": {"monster_zone": [{"code": 99, "name": "Target"}]},
+        },
+        legal_actions=(
+            ActionChoice("select_yesno", {"accept": False}),
+            ActionChoice("select_yesno", {"accept": True}),
+        ),
+        decision_type="select_yesno",
+    )
+
+    action = agent.predict(request)
+
+    assert action.arguments == {"accept": True}
+    assert len(agent._provider.calls) == 2
+    stages = agent.last_trace["input_token_breakdown"]["stages"]
+    assert stages["initial_decision"]["input_tokens"] == 100
+    assert stages["card_inspection"]["input_tokens"] == 200
+    assert agent.last_trace["card_cache"] == {
+        "available_before": [],
+        "hits": [],
+        "added": [1, 99],
+        "size_after": 2,
+    }
+
+
+def test_llm_agent_reuses_duel_card_cache_and_reset_clears_it() -> None:
+    class Provider:
+        def __init__(self) -> None:
+            self.calls: list[dict] = []
+
+        def respond(self, **kwargs):
+            self.calls.append(kwargs)
+            call_number = len(self.calls)
+            if call_number == 1:
+                return SimpleNamespace(
+                    text="",
+                    tool_calls=[
+                        SimpleNamespace(
+                            id="inspect-1",
+                            name="inspect_cards",
+                            arguments={"card_ids": [7]},
+                        )
+                    ],
+                    stop_reason="tool_calls",
+                    usage={},
+                    wallclock_seconds=0.1,
+                    provider_data={},
+                )
+            if call_number == 3:
+                prompt = kwargs["messages"][0]["content"]
+                assert "Duel-level inspected card cache" in prompt
+                assert '"code": 7' in prompt
+                assert '"name": "Cached Card"' in prompt
+                assert '"description": "Previously verified text."' in prompt
+            return SimpleNamespace(
+                text="",
+                tool_calls=[
+                    SimpleNamespace(
+                        id=f"action-{call_number}",
+                        name="select_yesno",
+                        arguments={"accept": True},
+                    )
+                ],
+                stop_reason="tool_calls",
+                usage={},
+                wallclock_seconds=0.1,
+                provider_data={},
+            )
+
+    agent = LLMFullDuelAgent.__new__(LLMFullDuelAgent)
+    agent._provider = Provider()
+    agent._tool_defs = {
+        "inspect_cards": {"name": "inspect_cards"},
+        "select_yesno": {"name": "select_yesno"},
+    }
+    agent._max_inspection_rounds = 1
+    agent._max_forced_retries = 2
+    agent._system_prompt = "system"
+    agent._observation_template = "{{STATE_JSON}} {{REQUIRED_RESPONDER}}"
+    agent.usage = {}
+    agent.model_calls = 0
+    agent.invalid_outputs = 0
+    agent.last_trace = {}
+    agent._inspected_card_cache = {}
+    request = DecisionRequest(
+        player=0,
+        observation={
+            "decision": {"responder": "select_yesno"},
+            "you": {
+                "hand": [
+                    {
+                        "code": 7,
+                        "name": "Cached Card",
+                        "description": "Previously verified text.",
+                        "attack": 9999,
+                        "location": "hand",
+                    }
+                ]
+            },
+        },
+        legal_actions=(
+            ActionChoice("select_yesno", {"accept": False}),
+            ActionChoice("select_yesno", {"accept": True}),
+        ),
+        decision_type="select_yesno",
+    )
+
+    agent.predict(request)
+    assert agent._inspected_card_cache == {
+        7: {
+            "code": 7,
+            "name": "Cached Card",
+            "description": "Previously verified text.",
+        }
+    }
+    agent.predict(request)
+    assert agent.last_trace["card_cache"] == {
+        "available_before": [7],
+        "hits": [],
+        "added": [],
+        "size_after": 1,
+    }
+
+    agent.reset()
+    assert agent._inspected_card_cache == {}
+
+
+def test_llm_agent_forfeits_after_three_missing_action_attempts() -> None:
+    class Provider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def respond(self, **_kwargs):
+            self.calls += 1
+            return SimpleNamespace(
+                text="no action",
+                tool_calls=[],
+                stop_reason="stop",
+                usage={},
+                wallclock_seconds=0.1,
+                provider_data={},
+            )
+
+    agent = LLMFullDuelAgent.__new__(LLMFullDuelAgent)
+    agent._provider = Provider()
+    agent._tool_defs = {
+        "inspect_cards": {"name": "inspect_cards"},
+        "select_yesno": {"name": "select_yesno"},
+    }
+    agent._max_inspection_rounds = 1
+    agent._max_forced_retries = 2  # Initial attempt + two corrections = three total.
+    agent._max_provider_connection_attempts = 3
+    agent._system_prompt = "system"
+    agent._observation_template = "{{STATE_JSON}} {{REQUIRED_RESPONDER}}"
+    agent.usage = {}
+    agent.model_calls = 0
+    agent.invalid_outputs = 0
+    agent.last_trace = {}
+    # A single legal action is deliberately automatic, so use two exact options.
+    request = DecisionRequest(
+        player=0,
+        observation={"decision": {"responder": "select_yesno"}},
+        legal_actions=(
+            ActionChoice("select_yesno", {"accept": False}),
+            ActionChoice("select_yesno", {"accept": True}),
+        ),
+        decision_type="select_yesno",
+    )
+    with pytest.raises(ProviderProtocolError) as error:
+        agent.predict(request)
+
+    assert agent._provider.calls == 3
+    assert error.value.diagnostics["model_action_attempts"] == 3
+    assert agent.last_trace["fallback"] is False
+    assert agent.last_trace["terminal_model_failure"] is True
 
 
 def test_compact_prompt_state_keeps_tactics_but_drops_card_text() -> None:

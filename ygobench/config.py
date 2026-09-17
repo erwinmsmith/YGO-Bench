@@ -24,20 +24,38 @@ class ModelConfig:
 _DEFAULT_MODELS = {
     "anthropic": "claude-sonnet-4-6",
     "deepseek": "deepseek-v4-flash",
-    "dashscope": "qwen3.7-flash",
     "openai": "gpt-5",
     "vllm": "local-model",
     "claude-cli": "claude-sonnet-4-6",
 }
 
 _PROFILE_DEFAULTS = {
+    "azopenai": {
+        "model_env": "AZOPENAI_MODEL",
+        "model": "gpt-5.6-luna",
+        "key_env": "AZOPENAI_API_KEY",
+        "base_env": "AZOPENAI_BASE_URL",
+        "base_url": "https://azopenai.gagawenai.com/v1",
+    },
     "bailian": {
         "model_env": "BAILIAN_MODEL",
         "model": "qwen3.7-flash",
+        # DashScope exposes an OpenAI-compatible endpoint. YGO-Bench injects
+        # its explicit thinking switch at the SDK boundary in the main repo,
+        # so a clean checkout does not depend on a patched vendor submodule.
+        "backend": "openai",
         "key_env": "BAILIAN_API_KEY",
         "fallback_key_env": "DASHSCOPE_API_KEY",
         "base_env": "BAILIAN_BASE_URL",
         "fallback_base_env": "DASHSCOPE_BASE_URL",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+    },
+    "dashscope": {
+        "model_env": "DASHSCOPE_MODEL",
+        "model": "qwen3.7-flash",
+        "backend": "openai",
+        "key_env": "DASHSCOPE_API_KEY",
+        "base_env": "DASHSCOPE_BASE_URL",
         "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
     },
     "external": {
@@ -77,7 +95,7 @@ def default_model_config(provider: str | None = None, model: str | None = None) 
             model=selected_model,
             base_url=base_url,
             api_key=api_key,
-            backend="openai",
+            backend=profile.get("backend", "openai"),
         )
     if selected_provider not in _DEFAULT_MODELS:
         known = ", ".join(sorted((*_DEFAULT_MODELS, *_PROFILE_DEFAULTS)))

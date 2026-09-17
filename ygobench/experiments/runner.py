@@ -76,27 +76,94 @@ def _git_commit(path: Path) -> str | None:
     return completed.stdout.strip() or None
 
 
-def _record_totals(rows: list[dict[str, Any]]) -> dict[str, list[Any]]:
-    totals: dict[str, list[Any]] = {
+INPUT_TOKEN_STAGES = (
+    "initial_decision",
+    "card_inspection",
+    "illegal_action_correction",
+    "action_protocol_correction",
+    "legacy_unclassified",
+)
+
+
+def _usage_events(row: dict[str, Any]):
+    """Yield every billed model turn, including exact-legal corrections."""
+
+    yield from row.get("trace", {}).get("turns", [])
+    correction = row.get("correction_trace") or {}
+    for attempt in correction.get("attempts", []):
+        trace = attempt.get("trace") or {}
+        if isinstance(trace.get("usage"), dict):
+            yield trace
+
+
+def _decision_token_usage_breakdown(
+    trace: dict[str, Any], correction_trace: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Return auditable per-decision input usage by request purpose."""
+
+    synthetic_row = {"trace": trace, "correction_trace": correction_trace}
+    stages = {
+        stage: {"model_calls": 0, "input_tokens": 0} for stage in INPUT_TOKEN_STAGES
+    }
+    for turn in _usage_events(synthetic_row):
+        stage = str(turn.get("request_stage") or "legacy_unclassified")
+        bucket = stages.setdefault(stage, {"model_calls": 0, "input_tokens": 0})
+        bucket["model_calls"] += 1
+        value = (turn.get("usage") or {}).get("input_tokens", 0)
+        if isinstance(value, (int, float)):
+            bucket["input_tokens"] += int(value)
+    return {
+        "initial_decision_input_tokens": stages["initial_decision"]["input_tokens"],
+        "card_inspection_input_tokens": stages["card_inspection"]["input_tokens"],
+        "illegal_action_correction_input_tokens": stages["illegal_action_correction"][
+            "input_tokens"
+        ],
+        "action_protocol_correction_input_tokens": stages["action_protocol_correction"][
+            "input_tokens"
+        ],
+        "legacy_unclassified_input_tokens": stages["legacy_unclassified"]["input_tokens"],
+        "model_calls_by_stage": {
+            stage: values["model_calls"] for stage, values in stages.items()
+        },
+        "input_tokens_total": sum(values["input_tokens"] for values in stages.values()),
+    }
+
+
+def _record_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    totals: dict[str, Any] = {
         "decisions": [0, 0],
         "illegal": [0, 0],
         "seconds": [0.0, 0.0],
         "model_calls": [0, 0],
         "input_tokens": [0, 0],
         "output_tokens": [0, 0],
+        "input_tokens_by_stage": {
+            stage: [0, 0] for stage in INPUT_TOKEN_STAGES
+        },
+        "model_calls_by_stage": {
+            stage: [0, 0] for stage in INPUT_TOKEN_STAGES
+        },
     }
     for row in rows:
         player = int(row["player"])
         totals["decisions"][player] += 1
         totals["illegal"][player] += int(not row.get("validation", {}).get("valid", False))
         totals["seconds"][player] += float(row.get("elapsed_seconds", 0.0))
-        for turn in row.get("trace", {}).get("turns", []):
+        for turn in _usage_events(row):
             totals["model_calls"][player] += 1
             usage = turn.get("usage", {})
             for key in ("input_tokens", "output_tokens"):
                 value = usage.get(key, 0)
                 if isinstance(value, (int, float)):
                     totals[key][player] += int(value)
+            stage = str(turn.get("request_stage") or "legacy_unclassified")
+            if stage not in totals["input_tokens_by_stage"]:
+                totals["input_tokens_by_stage"][stage] = [0, 0]
+                totals["model_calls_by_stage"][stage] = [0, 0]
+            totals["model_calls_by_stage"][stage][player] += 1
+            input_tokens = usage.get("input_tokens", 0)
+            if isinstance(input_tokens, (int, float)):
+                totals["input_tokens_by_stage"][stage][player] += int(input_tokens)
     return totals
 
 
@@ -556,6 +623,9 @@ def run_evidence_duel(
                 },
                 "trace": trace,
                 "correction_trace": correction_trace,
+                "token_usage_breakdown": _decision_token_usage_breakdown(
+                    trace, correction_trace
+                ),
                 "engine_events": step.events if step is not None else [],
                 "elapsed_seconds": round(elapsed, 6),
                 "oracle_before_hash": before["state_hash"],
@@ -655,6 +725,8 @@ def run_evidence_duel(
                 "model_calls": final_totals["model_calls"],
                 "input_tokens": final_totals["input_tokens"],
                 "output_tokens": final_totals["output_tokens"],
+                "input_tokens_by_stage": final_totals["input_tokens_by_stage"],
+                "model_calls_by_stage": final_totals["model_calls_by_stage"],
             },
             "elapsed_seconds": round(time.perf_counter() - started, 3),
         }

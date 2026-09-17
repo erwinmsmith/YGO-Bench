@@ -11,7 +11,11 @@ from pathlib import Path
 from typing import Any, Literal, TypeVar
 
 from ygobench.agents.llm_agent import compact_prompt_state
-from ygobench.agents.provider_limits import omit_reasoning_model_token_limit
+from ygobench.agents.provider_limits import (
+    force_provider_thinking_disabled,
+    omit_provider_token_limit,
+    omit_reasoning_model_token_limit,
+)
 from ygobench.config import default_model_config
 from ygobench.engine.upstream import UpstreamLayout
 from ygobench.experiments.identity import (
@@ -48,6 +52,7 @@ def _probe_policy_descriptor(
             "task_profile": "post_hoc_public_state_and_forecast_v2",
             "thinking_enabled": False,
             "reasoning_mode": "disabled",
+            "thinking_control": "explicit-provider-wire-disable-v1",
             "prompt_version": "exp3-exp5-public-prefix-v2",
             "tool_schema_version": "post-hoc-probe-tools-v2",
             "context_policy": "public-prefix-no-hidden-state-v2",
@@ -92,10 +97,13 @@ def _provider(provider_name: str | None = None, model: str | None = None):
         **({"api_key": config.api_key} if config.api_key else {}),
     )
     omit_reasoning_model_token_limit(provider)
+    if config.provider in {"bailian", "dashscope"}:
+        omit_provider_token_limit(provider)
     if hasattr(provider, "reasoning_effort"):
         provider.reasoning_effort = None
     if hasattr(provider, "thinking_enabled"):
         provider.thinking_enabled = False
+    force_provider_thinking_disabled(provider, provider_name=config.provider)
     return provider
 
 
