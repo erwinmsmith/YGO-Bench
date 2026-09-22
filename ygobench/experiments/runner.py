@@ -12,8 +12,9 @@ from pathlib import Path
 from typing import Any
 
 from ygobench.agents.factory import create_agent
+from ygobench.agents.llm_agent import ProviderCallError, ProviderProtocolError
 from ygobench.config import PROJECT_ROOT
-from ygobench.engine.full_duel import _derive_deck_shuffle_seeds, _passive_fallback
+from ygobench.engine.full_duel import _derive_deck_shuffle_seeds
 from ygobench.engine.protocol import ActionChoice, DecisionRequest
 from ygobench.experiments.config import ExperimentConfig, stable_id
 from ygobench.experiments.identity import (
@@ -318,6 +319,7 @@ def run_evidence_duel(
     game_dir.mkdir(parents=True, exist_ok=True)
     public = JsonlJournal(game_dir / "trajectory.jsonl")
     oracle = JsonlJournal(game_dir / "oracle_trajectory.jsonl")
+    technical_failures = JsonlJournal(game_dir / "technical_failures.jsonl")
     public_rows, oracle_rows = _reconcile(public, oracle)
     outcome_path = game_dir / "outcome.json"
     existing_outcome = read_json(outcome_path)
@@ -353,6 +355,9 @@ def run_evidence_duel(
     recent_actions: list[dict[str, Any]] = []
     termination = "decision_budget_exhausted"
     forfeit_winner: int | None = None
+    technical_failure_type: str | None = None
+    technical_failure_error: str | None = None
+    technical_failure_player: int | None = None
     started = time.perf_counter()
     interventions = interventions or {}
     replay_rows = [*replay_prefix, *public_rows] if replay_prefix is not None else public_rows
@@ -366,6 +371,7 @@ def run_evidence_duel(
             deck_root / f"{config.deck2}.ydk",
             seed=config.seed,
         )
+        last_stable_lp = [max(0, int(value)) for value in session.duel.state.lp]
         decision_index = 0
         while not session.done and (
             config.max_decisions <= 0 or decision_index < config.max_decisions
@@ -373,6 +379,9 @@ def run_evidence_duel(
             view = session.view(recent_actions)
             player = view["player"]
             before = view["oracle"]
+            last_stable_lp = [
+                max(0, int(value)) for value in before.get("tracked", {}).get("lp", last_stable_lp)
+            ]
             turn_before = int(session.duel.state.turn_count)
 
             # Deterministically replay already committed decisions without API calls.
@@ -410,13 +419,16 @@ def run_evidence_duel(
             attempted: ActionChoice | None = None
             executed: ActionChoice | None = None
             agent_error: str | None = None
+            model_error: str | None = None
+            api_error: str | None = None
             terminal_model_failure = False
+            decision_technical_failure = False
             model_action_attempts = 0
             call_started = time.perf_counter()
             try:
                 model_action_attempts = 1
                 attempted = interventions.get(decision_index) or agent.predict(request)
-            except Exception as exc:  # noqa: BLE001
+            except (ProviderCallError, ProviderProtocolError) as exc:
                 agent_error = f"{type(exc).__name__}: {exc}"
                 error_type = type(exc).__name__
                 previous_trace = getattr(agent, "last_trace", {})
@@ -436,24 +448,53 @@ def run_evidence_duel(
                     "fallback": False,
                     "exception": agent_error,
                     "provider_failure_type": error_type,
-                    "terminal_model_failure": True,
+                    "terminal_model_failure": isinstance(exc, ProviderProtocolError),
                 }
-                if error_type == "ProviderProtocolError":
+                if isinstance(exc, ProviderProtocolError):
                     trace["provider_protocol_diagnostics"] = getattr(exc, "diagnostics", None)
-                if getattr(exc, "provider_failure_type", None) == "provider_call":
+                    model_error = agent_error
+                    terminal_model_failure = True
+                    forfeit_winner = 1 - player
+                    termination = "model_retry_exhausted_forfeit"
+                else:
                     trace["provider_transport_attempts"] = getattr(exc, "attempts", [])
-                terminal_model_failure = True
-                forfeit_winner = 1 - player
-                termination = "model_retry_exhausted_forfeit"
+                    api_error = agent_error
+                    decision_technical_failure = True
+                    technical_failure_type = "api_failure"
+                    technical_failure_error = agent_error
+                    technical_failure_player = player
+                    termination = "api_failure_abort"
+            except Exception as exc:  # noqa: BLE001
+                agent_error = f"{type(exc).__name__}: {exc}"
+                model_error = None
+                decision_technical_failure = True
+                technical_failure_type = "agent_runtime_failure"
+                technical_failure_error = agent_error
+                technical_failure_player = player
+                termination = "agent_runtime_failure_abort"
+                previous_trace = getattr(agent, "last_trace", {})
+                trace = {
+                    **(previous_trace if isinstance(previous_trace, dict) else {}),
+                    "fallback": False,
+                    "exception": agent_error,
+                    "provider_failure_type": type(exc).__name__,
+                    "terminal_model_failure": False,
+                }
             else:
                 executed = attempted
                 if attempted.tool != expected:
                     agent_error = f"wrong_responder: expected {expected}, got {attempted.tool}"
+                    model_error = agent_error
                 trace = (
                     getattr(agent, "last_trace", {})
                     if decision_index not in interventions
                     else {"intervention": True}
                 )
+                if isinstance(trace, dict):
+                    model_action_attempts = max(
+                        model_action_attempts,
+                        int(trace.get("model_action_attempts", model_action_attempts)),
+                    )
             attempted_invalid = agent_error is not None
             recovery = "model_retry_exhausted_forfeit" if terminal_model_failure else "none"
             elapsed = time.perf_counter() - call_started
@@ -466,7 +507,12 @@ def run_evidence_duel(
             engine_error: str | None = None
             correction_trace: dict[str, Any] | None = None
             exact_legal_match = True
-            if not terminal_model_failure and exact_legal_check_performed and executed is not None:
+            if (
+                not terminal_model_failure
+                and not decision_technical_failure
+                and exact_legal_check_performed
+                and executed is not None
+            ):
                 try:
                     exact_legal_match = exact_legal_action_match(
                         executed,
@@ -478,8 +524,13 @@ def run_evidence_duel(
                     pre_engine_error = (
                         f"action_argument_validation_failed: {type(exc).__name__}: {exc}"
                     )
-            needs_model_correction = not terminal_model_failure and (
-                agent_error is not None or (exact_legal_check_performed and not exact_legal_match)
+            needs_model_correction = (
+                not terminal_model_failure
+                and not decision_technical_failure
+                and (
+                    agent_error is not None
+                    or (exact_legal_check_performed and not exact_legal_match)
+                )
             )
             if needs_model_correction:
                 if pre_engine_error is None and exact_legal_check_performed:
@@ -488,7 +539,9 @@ def run_evidence_duel(
                     )
                 attempted_invalid = True
                 correction_trace = {"attempts": []}
-                for correction_number in range(2, MAX_MODEL_ACTION_ATTEMPTS + 1):
+                for correction_number in range(
+                    model_action_attempts + 1, MAX_MODEL_ACTION_ATTEMPTS + 1
+                ):
                     model_action_attempts = correction_number
                     corrected: ActionChoice | None = None
                     attempt_trace: dict[str, Any]
@@ -499,8 +552,32 @@ def run_evidence_duel(
                     else:
                         try:
                             corrected, attempt_trace = agent.correct_invalid_action(request)
+                        except ProviderCallError as exc:
+                            api_error = f"ProviderCallError: {exc}"
+                            decision_technical_failure = True
+                            technical_failure_type = "api_failure"
+                            technical_failure_error = api_error
+                            technical_failure_player = player
+                            termination = "api_failure_abort"
+                            attempt_trace = {
+                                "exception": api_error,
+                                "provider_transport_attempts": getattr(exc, "attempts", []),
+                            }
+                        except ProviderProtocolError as exc:
+                            model_error = f"ProviderProtocolError: {exc}"
+                            attempt_trace = {
+                                "exception": model_error,
+                                "provider_protocol_diagnostics": getattr(
+                                    exc, "diagnostics", None
+                                ),
+                            }
                         except Exception as exc:  # noqa: BLE001
-                            attempt_trace = {"exception": f"{type(exc).__name__}: {exc}"}
+                            technical_failure_error = f"{type(exc).__name__}: {exc}"
+                            decision_technical_failure = True
+                            technical_failure_type = "agent_runtime_failure"
+                            technical_failure_player = player
+                            termination = "agent_runtime_failure_abort"
+                            attempt_trace = {"exception": technical_failure_error}
                     correction_trace["attempts"].append(
                         {
                             "attempt": correction_number,
@@ -508,6 +585,8 @@ def run_evidence_duel(
                             "trace": attempt_trace,
                         }
                     )
+                    if decision_technical_failure:
+                        break
                     try:
                         correction_is_legal = (
                             corrected is not None
@@ -537,7 +616,7 @@ def run_evidence_duel(
                     forfeit_winner = 1 - player
                     termination = "model_retry_exhausted_forfeit"
 
-            if terminal_model_failure:
+            if terminal_model_failure or decision_technical_failure:
                 after = before
                 step = None
             else:
@@ -546,18 +625,21 @@ def run_evidence_duel(
                     step = session.execute(executed)
                 except Exception as exc:  # noqa: BLE001
                     engine_rejection_error = f"{type(exc).__name__}: {exc}"
-                    attempted_invalid = True
-                    executed = _passive_fallback(session.duel.pending, session.replay_module)
-                    recovery = "deterministic_fallback_after_engine_error"
-                    try:
-                        step = session.execute(executed)
-                    except Exception as fallback_exc:  # noqa: BLE001
-                        engine_error = (
-                            f"fallback_failed: {type(fallback_exc).__name__}: {fallback_exc}"
-                        )
-                        termination = "engine_rejection_abort"
-                        step = None
-                after = build_oracle_state(session)
+                    engine_error = engine_rejection_error
+                    decision_technical_failure = True
+                    technical_failure_type = "engine_failure"
+                    technical_failure_error = engine_error
+                    technical_failure_player = player
+                    termination = "engine_failure_abort"
+                    recovery = "none"
+                    step = None
+                    after = before
+                else:
+                    after = build_oracle_state(session)
+                    last_stable_lp = [
+                        max(0, int(value))
+                        for value in after.get("tracked", {}).get("lp", last_stable_lp)
+                    ]
             decision_id = f"d{decision_index + 1:06d}"
             action_id = stable_id("action", [config.game_id, decision_id])
             action_summary = {
@@ -593,11 +675,17 @@ def run_evidence_duel(
                         and not diagnostics["protocol_errors"]
                     ),
                     "agent_error": agent_error,
+                    "model_error": model_error,
+                    "api_error": api_error,
                     "pre_engine_error": pre_engine_error,
                     "attempted_invalid": attempted_invalid,
                     "recovery": recovery,
                     "model_action_attempts": model_action_attempts,
                     "terminal_model_failure": terminal_model_failure,
+                    "technical_failure": decision_technical_failure,
+                    "technical_failure_type": (
+                        technical_failure_type if decision_technical_failure else None
+                    ),
                     "validation_scope": validation_scope,
                     "exact_legal_check_performed": exact_legal_check_performed,
                     "engine_submission_attempted": (
@@ -642,13 +730,24 @@ def run_evidence_duel(
                 "after": after,
                 "public_commit_hash": record["commit_hash"],
             }
-            oracle.append(oracle_record)
-            public.append(record)
-            previous_commit = record["commit_hash"]
-            if executed is not None:
-                recent_actions.append(action_summary)
-            decision_index += 1
-            if config.checkpoint_interval > 0 and decision_index % config.checkpoint_interval == 0:
+            if decision_technical_failure:
+                # A technical failure has no committed engine action.  Keep it
+                # in a separate evidence journal so a retry resumes from the
+                # same deterministic action prefix instead of replaying a
+                # nonexistent action.
+                technical_failures.append(record)
+            else:
+                oracle.append(oracle_record)
+                public.append(record)
+                previous_commit = record["commit_hash"]
+                if executed is not None:
+                    recent_actions.append(action_summary)
+                decision_index += 1
+            if (
+                not decision_technical_failure
+                and config.checkpoint_interval > 0
+                and decision_index % config.checkpoint_interval == 0
+            ):
                 atomic_write_json(
                     game_dir / "checkpoints" / f"checkpoint_{decision_index:06d}.json",
                     {
@@ -666,7 +765,7 @@ def run_evidence_duel(
                 {"status": "RUNNING", "committed_decisions": decision_index},
             )
             registry.renew(config.game_id)
-            if terminal_model_failure or engine_error:
+            if terminal_model_failure or decision_technical_failure:
                 break
 
         if forfeit_winner is None:
@@ -689,6 +788,11 @@ def run_evidence_duel(
             int(final_totals["illegal"][seat]) + int(external_prefix_totals["illegal"][seat])
             for seat in (0, 1)
         ]
+        final_lp_source = (
+            last_stable_lp if technical_failure_type is not None else session.duel.state.lp
+        )
+        final_lp = [max(0, int(value)) for value in final_lp_source]
+        rated_termination = termination in {"game_over", "model_retry_exhausted_forfeit"}
         outcome = {
             "schema_version": config.schema_version,
             "run_id": config.run_id,
@@ -696,10 +800,38 @@ def run_evidence_duel(
             "termination": termination,
             "game_over": game_over,
             "competitive_eligible": bool(
-                termination == "game_over" and not recovered_invalid_action
+                rated_termination and technical_failure_type is None
             ),
+            "technical_valid": technical_failure_type is None,
+            "technical_failure_type": technical_failure_type,
+            "technical_failure_error": technical_failure_error,
+            "technical_failure_player": technical_failure_player,
             "recovered_invalid_action": recovered_invalid_action,
             "winner": winner,
+            "win_reason": (
+                "model_retry_exhausted_forfeit"
+                if forfeit_winner is not None
+                else getattr(session.duel.state, "win_reason", None)
+            ),
+            "forfeit_player": (1 - forfeit_winner) if forfeit_winner is not None else None,
+            "adjudication": {
+                "kind": (
+                    "natural_engine_result"
+                    if termination == "game_over"
+                    else "rated_model_forfeit"
+                    if termination == "model_retry_exhausted_forfeit"
+                    else "unrated_technical_abort"
+                    if technical_failure_type is not None
+                    else "incomplete"
+                ),
+                "model_failure_player": (
+                    (1 - forfeit_winner) if forfeit_winner is not None else None
+                ),
+                "technical_failure_type": technical_failure_type,
+                "technical_failure_player": technical_failure_player,
+            },
+            "final_lp": final_lp,
+            "final_lp_source": "last_stable_engine_state",
             "agents": [config.agent1, config.agent2],
             "policy_identities": (
                 read_json(manifest_path).get("policy_identities", [])
@@ -734,9 +866,22 @@ def run_evidence_duel(
         _export_web_replay(run_dir, game_dir)
         atomic_write_json(
             game_dir / "status.json",
-            {"status": "COMPLETED", "committed_decisions": decision_index},
+            {
+                "status": (
+                    "COMPLETED" if technical_failure_type is None else "FAILED_RETRYABLE"
+                ),
+                "committed_decisions": decision_index,
+                "technical_failure_type": technical_failure_type,
+                "error": technical_failure_error,
+            },
         )
-        registry.finish(config.game_id)
+        if technical_failure_type is None:
+            registry.finish(config.game_id)
+        else:
+            registry.finish(
+                config.game_id,
+                error=f"{technical_failure_type}: {technical_failure_error}",
+            )
         return outcome
     except Exception as exc:
         registry.finish(config.game_id, error=f"{type(exc).__name__}: {exc}")

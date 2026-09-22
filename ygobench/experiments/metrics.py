@@ -112,17 +112,39 @@ def compute_probe_metrics(
         if row.get("availability_ground_truth") == 0 and row.get("behavior_ground_truth") == 1
     ]
     pool_counts: dict[str, int] = {}
+    global_pool_counts = next(
+        (
+            row.get("global_candidate_joint_stratum_counts")
+            for row in forecasts
+            if isinstance(row.get("global_candidate_joint_stratum_counts"), dict)
+        ),
+        None,
+    )
     seen_games: set[str] = set()
-    for row in forecasts:
-        game_id = str(row.get("game_id", "unknown"))
-        if game_id in seen_games:
-            continue
-        seen_games.add(game_id)
-        for key, value in (row.get("candidate_joint_stratum_counts") or {}).items():
-            pool_counts[key] = pool_counts.get(key, 0) + int(value)
+    if global_pool_counts is not None:
+        pool_counts = {str(key): int(value) for key, value in global_pool_counts.items()}
+    else:
+        for row in forecasts:
+            game_id = str(row.get("game_id", "unknown"))
+            if game_id in seen_games:
+                continue
+            seen_games.add(game_id)
+            for key, value in (row.get("candidate_joint_stratum_counts") or {}).items():
+                pool_counts[key] = pool_counts.get(key, 0) + int(value)
     pool_total = sum(pool_counts.values())
     pool_availability_positive = pool_counts.get("A1B0", 0) + pool_counts.get("A1B1", 0)
     pool_behavior_positive = pool_counts.get("A1B1", 0)
+    support_by_joint_stratum = {
+        label: {
+            "candidates": pool_counts.get(label, 0),
+            "status": (
+                "ADEQUATE_SUPPORT"
+                if pool_counts.get(label, 0) >= 20
+                else "LOW_SAMPLE_SUPPORT"
+            ),
+        }
+        for label in ("A0B0", "A1B0", "A1B1")
+    }
     evaluator_identity = next(
         (
             row.get("evaluator_identity")
@@ -155,6 +177,8 @@ def compute_probe_metrics(
         "impossible_a0_b1_samples": [row.get("sample_id") for row in impossible],
         "candidate_pool": {
             "joint_stratum_counts": dict(sorted(pool_counts.items())),
+            "support_by_joint_stratum": support_by_joint_stratum,
+            "low_support_threshold": 20,
             "total": pool_total,
             "availability_prevalence": rate(pool_availability_positive, pool_total),
             "behavior_prevalence_given_availability": rate(

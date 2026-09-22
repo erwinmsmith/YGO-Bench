@@ -14,7 +14,6 @@ from ygobench.agents.llm_agent import compact_prompt_state
 from ygobench.agents.provider_limits import (
     force_provider_thinking_disabled,
     omit_provider_token_limit,
-    omit_reasoning_model_token_limit,
 )
 from ygobench.config import default_model_config
 from ygobench.engine.upstream import UpstreamLayout
@@ -23,12 +22,18 @@ from ygobench.experiments.identity import (
     policy_descriptor,
     policy_id,
 )
-from ygobench.experiments.io import JsonlJournal, content_hash
+from ygobench.experiments.io import JsonlJournal, atomic_write_json, content_hash
 
 _COMMITMENT_COMMANDS = {"activate", "summon", "sp_summon", "attack"}
 _NEW_DECISION_BOUNDARIES = {"select_idlecmd", "select_battlecmd", "rock_paper_scissors"}
 ForecastSampling = Literal["chronological", "stratified"]
 T = TypeVar("T")
+
+FORMAL_STATE_SAMPLES_PER_MODEL = 48
+FORMAL_FORECAST_SAMPLES_PER_MODEL = 90
+PILOT_STATE_SAMPLES_PER_MODEL = 24
+PILOT_FORECAST_SAMPLES_PER_MODEL = 45
+PROBE_SAMPLING_VERSION = "budget-stratified-v1"
 
 
 def _probe_policy_descriptor(
@@ -96,13 +101,7 @@ def _provider(provider_name: str | None = None, model: str | None = None):
         **({"base_url": config.base_url} if config.base_url else {}),
         **({"api_key": config.api_key} if config.api_key else {}),
     )
-    omit_reasoning_model_token_limit(provider)
-    if config.provider in {"bailian", "dashscope"}:
-        omit_provider_token_limit(provider)
-    if hasattr(provider, "reasoning_effort"):
-        provider.reasoning_effort = None
-    if hasattr(provider, "thinking_enabled"):
-        provider.thinking_enabled = False
+    omit_provider_token_limit(provider)
     force_provider_thinking_disabled(provider, provider_name=config.provider)
     return provider
 
@@ -407,10 +406,194 @@ def _select_across_games(samples: list[T], count: int) -> list[T]:
     return selected
 
 
+def _stable_round_robin(samples: list[dict[str, Any]], *, salt: str) -> list[dict[str, Any]]:
+    """Order a stratum reproducibly while exhausting distinct games first."""
+
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for sample in samples:
+        groups.setdefault(str(sample.get("game_id", "unknown")), []).append(sample)
+    for game_samples in groups.values():
+        game_samples.sort(
+            key=lambda sample: content_hash(
+                [PROBE_SAMPLING_VERSION, salt, str(sample.get("sample_id"))]
+            )
+        )
+    ordered: list[dict[str, Any]] = []
+    game_order = sorted(
+        groups,
+        key=lambda game_id: content_hash(
+            [PROBE_SAMPLING_VERSION, salt, "game", game_id]
+        ),
+    )
+    depth = 0
+    while True:
+        progressed = False
+        for game_id in game_order:
+            if depth < len(groups[game_id]):
+                ordered.append(groups[game_id][depth])
+                progressed = True
+        if not progressed:
+            return ordered
+        depth += 1
+
+
+def _interleaved_strata(
+    groups: dict[str, list[dict[str, Any]]], order: tuple[str, ...]
+) -> list[dict[str, Any]]:
+    """Build a prefix-stable balanced sequence across the requested strata."""
+
+    sequence: list[dict[str, Any]] = []
+    depth = 0
+    while True:
+        progressed = False
+        for label in order:
+            values = groups.get(label, [])
+            if depth < len(values):
+                sequence.append(values[depth])
+                progressed = True
+        if not progressed:
+            return sequence
+        depth += 1
+
+
+def _spread_across_games(sequence: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Prefer one sample per duel before admitting a second or third sample."""
+
+    ordered: list[dict[str, Any]] = []
+    selected_ids: set[str] = set()
+    per_game: Counter[str] = Counter()
+    cap = 1
+    while len(ordered) < len(sequence):
+        progressed = False
+        for sample in sequence:
+            sample_id = str(sample.get("sample_id"))
+            game_id = str(sample.get("game_id", "unknown"))
+            if sample_id in selected_ids or per_game[game_id] >= cap:
+                continue
+            ordered.append(sample)
+            selected_ids.add(sample_id)
+            per_game[game_id] += 1
+            progressed = True
+        if not progressed:
+            break
+        cap += 1
+    return ordered
+
+
+def _progress_quartile(value: float) -> str:
+    if value <= 0.25:
+        return "Q1"
+    if value <= 0.5:
+        return "Q2"
+    if value <= 0.75:
+        return "Q3"
+    return "Q4"
+
+
+def _state_complexity_score(sample: dict[str, Any]) -> int:
+    values = sample.get("state_complexity", {})
+    public_cards = sum(
+        len(value)
+        for key, value in (sample.get("ground_truth") or {}).items()
+        if key.endswith("known_public_cards") and isinstance(value, list)
+    )
+    return (
+        3 * int(values.get("chain_depth", 0) or 0)
+        + 2 * int(values.get("zone_transition_events", 0) or 0)
+        + int(values.get("historical_public_activation_count", 0) or 0)
+        + public_cards
+    )
+
+
+def _select_state_samples(
+    candidates: list[dict[str, Any]], max_samples: int
+) -> list[dict[str, Any]]:
+    """Select Q1-Q4 x Low/High states with a prefix-stable budget sequence."""
+
+    if max_samples <= 0 or not candidates:
+        return []
+    low_ids: set[str] = set()
+    for quartile in ("Q1", "Q2", "Q3", "Q4"):
+        ranked = sorted(
+            [
+                sample
+                for sample in candidates
+                if _progress_quartile(float(sample.get("trajectory_progress", 0))) == quartile
+            ],
+            key=lambda sample: (_state_complexity_score(sample), str(sample.get("sample_id"))),
+        )
+        low_ids.update(
+            str(sample["sample_id"]) for sample in ranked[: (len(ranked) + 1) // 2]
+        )
+    annotated: list[dict[str, Any]] = []
+    for source in candidates:
+        sample = dict(source)
+        band = "Low" if str(sample["sample_id"]) in low_ids else "High"
+        quartile = _progress_quartile(float(sample.get("trajectory_progress", 0)))
+        sample["state_complexity_score"] = _state_complexity_score(sample)
+        sample["state_complexity_band"] = band
+        sample["state_sampling_stratum"] = f"{quartile}_{band}"
+        annotated.append(sample)
+    order = tuple(f"Q{quartile}_{band}" for quartile in range(1, 5) for band in ("Low", "High"))
+    groups = {
+        label: _stable_round_robin(
+            [sample for sample in annotated if sample["state_sampling_stratum"] == label],
+            salt=f"state:{label}",
+        )
+        for label in order
+    }
+    selected = _spread_across_games(_interleaved_strata(groups, order))[
+        : min(max_samples, len(annotated))
+    ]
+    pool_counts = Counter(sample["state_sampling_stratum"] for sample in annotated)
+    selected_counts = Counter(sample["state_sampling_stratum"] for sample in selected)
+    for sample in selected:
+        label = sample["state_sampling_stratum"]
+        sample["inclusion_probability"] = selected_counts[label] / pool_counts[label]
+        sample["candidate_state_stratum_counts"] = dict(sorted(pool_counts.items()))
+    return selected
+
+
+def _select_forecast_samples(
+    candidates: list[dict[str, Any]],
+    *,
+    max_samples: int,
+    sampling: ForecastSampling,
+) -> list[dict[str, Any]]:
+    """Select global A0B0/A1B0/A1B1 strata with expansion-safe prefixes."""
+
+    if max_samples <= 0 or not candidates:
+        return []
+    if sampling == "chronological":
+        selected = _select_across_games(candidates, max_samples)
+    elif sampling == "stratified":
+        order = ("A0B0", "A1B0", "A1B1")
+        groups = {
+            label: _stable_round_robin(
+                [sample for sample in candidates if sample.get("joint_stratum") == label],
+                salt=f"forecast:{label}",
+            )
+            for label in order
+        }
+        selected = _spread_across_games(_interleaved_strata(groups, order))[
+            : min(max_samples, len(candidates))
+        ]
+    else:
+        raise ValueError(f"Unsupported forecast sampling policy: {sampling}")
+    selected = [dict(sample) for sample in selected]
+    pool_counts = Counter(str(sample.get("joint_stratum")) for sample in candidates)
+    selected_counts = Counter(str(sample.get("joint_stratum")) for sample in selected)
+    for sample in selected:
+        label = str(sample["joint_stratum"])
+        sample["inclusion_probability"] = selected_counts[label] / pool_counts[label]
+        sample["global_candidate_joint_stratum_counts"] = dict(sorted(pool_counts.items()))
+    return selected
+
+
 def extract_probe_samples(
     run_dir: Path,
     *,
-    max_forecasts_per_game: int = 8,
+    max_forecasts_per_game: int = 0,
     forecast_sampling: ForecastSampling = "stratified",
 ) -> dict[str, int]:
     state_out = JsonlJournal(run_dir / "derived" / "state_probe_samples.jsonl")
@@ -527,11 +710,15 @@ def extract_probe_samples(
         if impossible:
             raise ValueError(f"{game_dir.name} contains logically impossible A0B1 forecast windows")
 
-        selected_forecasts = _select_forecast_candidates(
-            forecast_candidates,
-            max_samples=max_forecasts_per_game,
-            sampling=forecast_sampling,
-            seed=int(config["seed"]),
+        selected_forecasts = (
+            _select_forecast_candidates(
+                forecast_candidates,
+                max_samples=max_forecasts_per_game,
+                sampling=forecast_sampling,
+                seed=int(config["seed"]),
+            )
+            if max_forecasts_per_game > 0
+            else forecast_candidates
         )
         candidate_strata = Counter(candidate["joint_stratum"] for candidate in forecast_candidates)
         selected_strata = Counter(candidate["joint_stratum"] for candidate in selected_forecasts)
@@ -560,8 +747,9 @@ def run_probes(
     *,
     provider_name: str | None = None,
     model: str | None = None,
-    max_state_samples: int = 4,
-    max_forecast_samples: int = 4,
+    max_state_samples: int = FORMAL_STATE_SAMPLES_PER_MODEL,
+    max_forecast_samples: int = FORMAL_FORECAST_SAMPLES_PER_MODEL,
+    forecast_sampling: ForecastSampling = "stratified",
     experiments: tuple[str, ...] = ("exp3", "exp5"),
 ) -> dict[str, int]:
     unknown = set(experiments) - {"exp3", "exp5"}
@@ -571,7 +759,7 @@ def run_probes(
     evaluator_id = evaluator_identity["evaluator_id"]
     provider = _provider(provider_name, model)
     state_samples = (
-        _select_across_games(
+        _select_state_samples(
             JsonlJournal(run_dir / "derived" / "state_probe_samples.jsonl").recover(),
             max_state_samples,
         )
@@ -579,30 +767,99 @@ def run_probes(
         else []
     )
     forecast_samples = (
-        _select_across_games(
+        _select_forecast_samples(
             JsonlJournal(run_dir / "derived" / "forecast_samples.jsonl").recover(),
-            max_forecast_samples,
+            max_samples=max_forecast_samples,
+            sampling=forecast_sampling,
         )
         if "exp5" in experiments
         else []
     )
     output_dir = run_dir / "derived" / "probe_results" / evaluator_id
+    sample_manifest = {
+        "sampling_version": PROBE_SAMPLING_VERSION,
+        "budget": {
+            "state_samples_requested": max_state_samples,
+            "forecast_samples_requested": max_forecast_samples,
+            "pilot_defaults": {
+                "state": PILOT_STATE_SAMPLES_PER_MODEL,
+                "forecast": PILOT_FORECAST_SAMPLES_PER_MODEL,
+            },
+            "formal_defaults": {
+                "state": FORMAL_STATE_SAMPLES_PER_MODEL,
+                "forecast": FORMAL_FORECAST_SAMPLES_PER_MODEL,
+            },
+        },
+        "prefix_extension_safe": True,
+        "state_sample_ids": [sample["sample_id"] for sample in state_samples],
+        "forecast_sample_ids": [sample["sample_id"] for sample in forecast_samples],
+        "state_stratum_counts": dict(
+            sorted(Counter(sample["state_sampling_stratum"] for sample in state_samples).items())
+        ),
+        "forecast_stratum_counts": dict(
+            sorted(Counter(sample["joint_stratum"] for sample in forecast_samples).items())
+        ),
+        "state_pool_hash": content_hash(
+            [
+                sample["sample_id"]
+                for sample in JsonlJournal(
+                    run_dir / "derived" / "state_probe_samples.jsonl"
+                ).recover()
+            ]
+        ),
+        "forecast_pool_hash": content_hash(
+            [
+                sample["sample_id"]
+                for sample in JsonlJournal(run_dir / "derived" / "forecast_samples.jsonl").recover()
+            ]
+        ),
+    }
+    atomic_write_json(output_dir / "sample_manifest.json", sample_manifest)
     state_out = JsonlJournal(output_dir / "state_probe_results.jsonl")
     forecast_out = JsonlJournal(output_dir / "forecast_results.jsonl")
-    state_hashes = {sample["sample_id"]: content_hash(sample) for sample in state_samples}
-    forecast_hashes = {sample["sample_id"]: content_hash(sample) for sample in forecast_samples}
+    sampling_fields = {
+        "inclusion_probability",
+        "candidate_state_stratum_counts",
+        "global_candidate_joint_stratum_counts",
+    }
+
+    def payload_hash(sample: dict[str, Any]) -> str:
+        return content_hash(
+            {key: value for key, value in sample.items() if key not in sampling_fields}
+        )
+
+    state_hashes = {sample["sample_id"]: payload_hash(sample) for sample in state_samples}
+    forecast_hashes = {sample["sample_id"]: payload_hash(sample) for sample in forecast_samples}
+    state_by_id = {sample["sample_id"]: sample for sample in state_samples}
+    forecast_by_id = {sample["sample_id"]: sample for sample in forecast_samples}
     retained_state = state_out.recover()
     retained_forecast = forecast_out.recover()
     if "exp3" in experiments:
         retained_state = [
-            row
+            {
+                **row,
+                "inclusion_probability": state_by_id[row["sample_id"]].get(
+                    "inclusion_probability"
+                ),
+                "candidate_state_stratum_counts": state_by_id[row["sample_id"]].get(
+                    "candidate_state_stratum_counts"
+                ),
+            }
             for row in retained_state
             if row.get("sample_hash") == state_hashes.get(row.get("sample_id"))
         ]
         state_out.rewrite(retained_state)
     if "exp5" in experiments:
         retained_forecast = [
-            row
+            {
+                **row,
+                "inclusion_probability": forecast_by_id[row["sample_id"]].get(
+                    "inclusion_probability"
+                ),
+                "global_candidate_joint_stratum_counts": forecast_by_id[
+                    row["sample_id"]
+                ].get("global_candidate_joint_stratum_counts"),
+            }
             for row in retained_forecast
             if row.get("sample_hash") == forecast_hashes.get(row.get("sample_id"))
         ]
@@ -672,6 +929,13 @@ def run_probes(
                 "trajectory_progress": sample["trajectory_progress"],
                 "checkpoint_tags": sample["checkpoint_tags"],
                 "state_complexity": sample["state_complexity"],
+                "state_complexity_score": sample["state_complexity_score"],
+                "state_complexity_band": sample["state_complexity_band"],
+                "state_sampling_stratum": sample["state_sampling_stratum"],
+                "inclusion_probability": sample.get("inclusion_probability"),
+                "candidate_state_stratum_counts": sample.get(
+                    "candidate_state_stratum_counts"
+                ),
                 "usage": turn.usage,
                 "elapsed_seconds": turn.wallclock_seconds,
             }
@@ -756,6 +1020,9 @@ def run_probes(
                 "joint_stratum": sample["joint_stratum"],
                 "inclusion_probability": sample.get("inclusion_probability"),
                 "candidate_joint_stratum_counts": sample.get("candidate_joint_stratum_counts"),
+                "global_candidate_joint_stratum_counts": sample.get(
+                    "global_candidate_joint_stratum_counts"
+                ),
                 "strata": sample["strata"],
                 "usage": turn.usage,
                 "elapsed_seconds": turn.wallclock_seconds,

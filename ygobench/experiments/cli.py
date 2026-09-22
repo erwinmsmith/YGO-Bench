@@ -52,8 +52,8 @@ def build_parser() -> argparse.ArgumentParser:
     probes = sub.add_parser("phase3")
     probes.add_argument("--run-id", required=True)
     probes.add_argument("--extract-only", action="store_true")
-    probes.add_argument("--max-state-samples", type=int, default=4)
-    probes.add_argument("--max-forecast-samples", type=int, default=4)
+    probes.add_argument("--max-state-samples", type=int, default=48)
+    probes.add_argument("--max-forecast-samples", type=int, default=90)
     probes.add_argument(
         "--experiments",
         nargs="+",
@@ -98,8 +98,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     evaluate.add_argument("--provider", default="deepseek")
     evaluate.add_argument("--model", default=None)
-    evaluate.add_argument("--max-state-samples", type=int, default=4)
-    evaluate.add_argument("--max-forecast-samples", type=int, default=4)
+    evaluate.add_argument("--max-state-samples", type=int, default=48)
+    evaluate.add_argument("--max-forecast-samples", type=int, default=90)
     evaluate.add_argument("--offline-sample-size", type=int, default=10)
     evaluate.add_argument("--offline-horizon", type=int, default=32)
     evaluate.add_argument("--bootstrap-seed", type=int, default=0)
@@ -168,6 +168,7 @@ def main() -> int:
                 model=args.model,
                 max_state_samples=args.max_state_samples,
                 max_forecast_samples=args.max_forecast_samples,
+                forecast_sampling=args.forecast_sampling,
                 experiments=tuple(args.experiments),
             )
             result["metrics"] = compute_probe_metrics(

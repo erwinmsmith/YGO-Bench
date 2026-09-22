@@ -74,7 +74,9 @@ def build_capability_matrix(run_dir: Path) -> tuple[list[dict[str, Any]], list[d
             "policy_id": row["policy"],
             "model_configuration_id": row.get("model_configuration_id"),
             "agent": row.get("agent"),
-            "strict_duels": row.get("strict_games", 0),
+            "rated_duels": row.get("rated_games", row.get("strict_games", 0)),
+            # Compatibility field for pre-v3 consumers.
+            "strict_duels": row.get("rated_games", row.get("strict_games", 0)),
             "glicko2_mu": (row.get("glicko2") or {}).get("mu"),
             "side_swapped_win_rate": row.get("overall_win_rate"),
             "glicko2_rd": (row.get("glicko2") or {}).get("rd_phi"),
@@ -188,6 +190,7 @@ def _correlation(rows: list[dict[str, Any]], left: str, right: str) -> dict[str,
         "right": right,
         "n_models": len(overlap),
         "models": [row["policy_id"] for row in overlap],
+        "rated_duels_by_model": {row["policy_id"]: row.get("rated_duels", 0) for row in overlap},
         "strict_duels_by_model": {row["policy_id"]: row.get("strict_duels", 0) for row in overlap},
         "spearman_rho": estimate,
         "status": "COMPLETED"

@@ -204,13 +204,6 @@ def _normalize_action(action: ActionChoice, core: Any, tools_module: Any) -> dic
     return tools_module.coerce_args(action.tool, args)
 
 
-def _passive_fallback(pending: Any, replay_module: Any) -> ActionChoice:
-    tool, arguments = replay_module._pick_passive_opponent_response(pending)
-    if "ROCK_PAPER_SCISSORS" in str(pending.msg_name).upper():
-        arguments = {"hand": 1 if pending.player == 0 else 2}
-    return ActionChoice(tool=tool, arguments=arguments, label="engine fallback")
-
-
 def run_duel(
     deck1_path: Path,
     deck2_path: Path,
@@ -254,6 +247,8 @@ def run_duel(
     decision_seconds = [0.0, 0.0]
     termination = "decision_budget_exhausted"
     forfeit_winner: int | None = None
+    technical_failure_type: str | None = None
+    technical_failure_error: str | None = None
     recent_actions: list[dict[str, Any]] = []
     try:
         deck1 = _parse_deck(deck1_path)
@@ -330,9 +325,34 @@ def run_duel(
             try:
                 action = agent.predict(request)
             except Exception as exc:  # noqa: BLE001
-                action = _passive_fallback(duel.pending, replay_module)
-                illegal[player] += 1
                 agent_error = f"{type(exc).__name__}: {exc}"
+                if type(exc).__name__ == "ProviderProtocolError":
+                    illegal[player] += 1
+                    forfeit_winner = 1 - player
+                    termination = "model_retry_exhausted_forfeit"
+                    resolution = "rated_model_forfeit"
+                else:
+                    technical_failure_type = (
+                        "api_failure"
+                        if type(exc).__name__ == "ProviderCallError"
+                        else "agent_runtime_failure"
+                    )
+                    technical_failure_error = agent_error
+                    termination = f"{technical_failure_type}_abort"
+                    resolution = "unrated_technical_abort"
+                log(
+                    {
+                        "type": "decision_failure",
+                        "player": player,
+                        "agent": agent.name,
+                        "error": agent_error,
+                        "error_domain": (
+                            "model" if forfeit_winner is not None else technical_failure_type
+                        ),
+                        "resolution": resolution,
+                    }
+                )
+                break
             elapsed = time.perf_counter() - call_started
             decision_seconds[player] += elapsed
 
@@ -340,7 +360,19 @@ def run_duel(
             if action.tool != expected:
                 agent_error = f"expected {expected}, got {action.tool}"
                 illegal[player] += 1
-                action = _passive_fallback(duel.pending, replay_module)
+                forfeit_winner = 1 - player
+                termination = "model_retry_exhausted_forfeit"
+                log(
+                    {
+                        "type": "decision_failure",
+                        "player": player,
+                        "agent": agent.name,
+                        "error": agent_error,
+                        "error_domain": "model",
+                        "resolution": "rated_model_forfeit",
+                    }
+                )
+                break
 
             trace = getattr(agent, "last_trace", {})
             log(
@@ -358,21 +390,21 @@ def run_duel(
             try:
                 method = getattr(duel, tools_module.TOOL_TO_HARNESS_METHOD[action.tool])
                 step = method(**_normalize_action(action, core, tools_module))
-                is_fallback = False
             except Exception as exc:  # noqa: BLE001
-                illegal[player] += 1
+                technical_failure_type = "engine_failure"
+                technical_failure_error = f"{type(exc).__name__}: {exc}"
                 log(
                     {
-                        "type": "invalid_action",
+                        "type": "decision_failure",
                         "player": player,
                         "agent": agent.name,
                         "attempted": {"name": action.tool, "arguments": action.arguments},
-                        "error": f"{type(exc).__name__}: {exc}",
-                        "resolution": "forfeit",
+                        "error": technical_failure_error,
+                        "error_domain": "engine",
+                        "resolution": "unrated_technical_abort",
                     }
                 )
-                forfeit_winner = 1 - player
-                termination = "illegal_action_forfeit"
+                termination = "engine_failure_abort"
                 break
             decisions += 1
             decisions_by_player[player] += 1
@@ -383,7 +415,6 @@ def run_duel(
                 "agent": agent.name,
                 "tool": action.tool,
                 "arguments": action.arguments,
-                "fallback": is_fallback,
             }
             recent_actions.append(action_record)
             log(
@@ -392,15 +423,12 @@ def run_duel(
                     "player": player,
                     "tool": action.tool,
                     "events": step.events,
-                    "fallback": is_fallback,
                 }
             )
 
-        if forfeit_winner is not None:
-            termination = "illegal_action_forfeit"
-        elif duel.state.game_over:
+        if duel.state.game_over and forfeit_winner is None and technical_failure_type is None:
             termination = "game_over"
-        elif duel.pending is None:
+        elif duel.pending is None and forfeit_winner is None and technical_failure_type is None:
             termination = "no_pending_decision"
         elapsed_total = round(time.perf_counter() - started_at, 3)
         winner_value = forfeit_winner if forfeit_winner is not None else duel.state.winner
@@ -410,10 +438,17 @@ def run_duel(
             "benchmark_type": "full_duel",
             "termination": termination,
             "game_over": logical_game_over,
+            "competitive_eligible": bool(
+                technical_failure_type is None
+                and termination in {"game_over", "model_retry_exhausted_forfeit"}
+            ),
+            "technical_valid": technical_failure_type is None,
+            "technical_failure_type": technical_failure_type,
+            "technical_failure_error": technical_failure_error,
             "winner": winner_value,
             "winner_agent": (agents[winner_value].name if winner_value is not None else None),
             "turn_count": duel.state.turn_count,
-            "lp": list(duel.state.lp),
+            "lp": [max(0, int(value)) for value in duel.state.lp],
             "tool_calls_used": decisions,
             "decisions_by_player": decisions_by_player,
             "illegal_actions": illegal,
@@ -434,7 +469,7 @@ def run_duel(
         game_over=duel.state.game_over or forfeit_winner is not None,
         decisions=decisions,
         turn_count=duel.state.turn_count,
-        lp=tuple(duel.state.lp),
+        lp=(max(0, int(duel.state.lp[0])), max(0, int(duel.state.lp[1]))),
         termination=termination,
         replay_path=replay_path,
         agent1=agent1.name,

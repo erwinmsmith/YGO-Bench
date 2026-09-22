@@ -38,7 +38,12 @@ def omit_provider_token_limit(provider: Any) -> Any:
 
     if getattr(provider, "_ygobench_uncapped", False):
         return provider
-    completions = provider._client.chat.completions
+    try:
+        completions = provider._client.chat.completions
+    except AttributeError as exc:
+        raise ValueError(
+            f"provider {getattr(provider, 'name', 'unknown')!r} cannot omit its token limit"
+        ) from exc
     create = completions.create
 
     @wraps(create)
@@ -71,6 +76,7 @@ def force_deepseek_thinking_mode(provider: Any, *, enabled: bool) -> Any:
         return provider
 
     provider._ygobench_thinking_mode = "enabled" if enabled else "disabled"
+    provider._ygobench_thinking_control = "deepseek.extra_body.thinking.type"
     provider.thinking_enabled = enabled
     if not enabled:
         provider.reasoning_effort = None
@@ -101,6 +107,7 @@ def force_qwen_thinking_mode(provider: Any, *, enabled: bool) -> Any:
     """Send DashScope's explicit ``enable_thinking`` flag on every request."""
 
     provider._ygobench_qwen_thinking_enabled = enabled
+    provider._ygobench_thinking_control = "dashscope.extra_body.enable_thinking"
     provider.thinking_enabled = enabled
     if not enabled and hasattr(provider, "reasoning_effort"):
         provider.reasoning_effort = None
@@ -123,6 +130,33 @@ def force_qwen_thinking_mode(provider: Any, *, enabled: bool) -> Any:
     return provider
 
 
+def force_openai_thinking_disabled(provider: Any) -> Any:
+    """Send the OpenAI-compatible non-reasoning setting on every request.
+
+    OpenAI-compatible GPT endpoints may enable reasoning when the field is
+    omitted.  Setting an attribute on the provider is only useful for logging;
+    this wrapper changes the actual wire request.
+    """
+
+    provider.thinking_enabled = False
+    provider.reasoning_effort = "none"
+    provider._ygobench_thinking_control = "openai.reasoning_effort"
+    if getattr(provider, "_ygobench_openai_thinking_disabled", False):
+        return provider
+
+    completions = provider._client.chat.completions
+    create = completions.create
+
+    @wraps(create)
+    def create_without_reasoning(*args: Any, **kwargs: Any) -> Any:
+        kwargs["reasoning_effort"] = "none"
+        return create(*args, **kwargs)
+
+    completions.create = create_without_reasoning
+    provider._ygobench_openai_thinking_disabled = True
+    return provider
+
+
 def force_provider_thinking_disabled(
     provider: Any, *, provider_name: str | None = None
 ) -> Any:
@@ -138,7 +172,11 @@ def force_provider_thinking_disabled(
         return force_deepseek_thinking_mode(provider, enabled=False)
     if name in {"bailian", "dashscope", "qwen"}:
         return force_qwen_thinking_mode(provider, enabled=False)
-    return provider
+    if name in {"openai", "azopenai"}:
+        return force_openai_thinking_disabled(provider)
+    raise ValueError(
+        f"provider {name!r} has no explicit thinking-disable adapter; formal runs fail closed"
+    )
 
 
 def force_single_tool_call(provider: Any) -> Any:

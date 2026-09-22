@@ -1,3 +1,5 @@
+from collections import Counter
+
 import pytest
 
 import ygobench.experiments.replanning as replanning
@@ -16,6 +18,8 @@ from ygobench.experiments.metrics import (
 from ygobench.experiments.probes import (
     _select_across_games,
     _select_forecast_candidates,
+    _select_forecast_samples,
+    _select_state_samples,
 )
 from ygobench.experiments.replanning import kaplan_meier_action_survival
 from ygobench.experiments.statistics import (
@@ -89,9 +93,85 @@ def test_policy_identity_separates_prompt_but_model_configuration_does_not() -> 
     assert model_configuration_id(left) != model_configuration_id(hotter)
 
 
+def test_model_configuration_matches_duel_and_posthoc_runtime_contract() -> None:
+    duel = policy_descriptor(
+        "react:azopenai:gpt-5.6-luna",
+        runtime={
+            "provider": "azopenai",
+            "model": "gpt-5.6-luna",
+            "thinking_enabled": False,
+            "reasoning_effort": "none",
+            "temperature": 0.0,
+            "max_tokens": None,
+            "token_limit_policy": "omitted_from_request",
+        },
+    )
+    probe = policy_descriptor(
+        "react-fast:azopenai:gpt-5.6-luna",
+        runtime={
+            "provider": "azopenai",
+            "model": "gpt-5.6-luna",
+            "thinking_enabled": False,
+            "reasoning_effort": None,
+            "temperature": 0.0,
+            "max_tokens": None,
+            "token_limit_policy": "omitted_from_request",
+        },
+    )
+    assert policy_id(duel) != policy_id(probe)
+    assert model_configuration_id(duel) == model_configuration_id(probe)
+
+
 def test_nearest_rank_and_spearman_ties() -> None:
     assert nearest_rank([4, 7, 21, 6, 8], 0.75) == 8
     assert spearman([1, 1, 3], [1, 2, 3]) == pytest.approx(0.8660254)
+
+
+def test_budget_state_sampling_is_balanced_and_prefix_extendable() -> None:
+    candidates = []
+    for quartile, progress in enumerate((0.2, 0.4, 0.7, 0.9), start=1):
+        for index in range(12):
+            candidates.append(
+                {
+                    "sample_id": f"q{quartile}-{index}",
+                    "game_id": f"g{quartile}-{index}",
+                    "trajectory_progress": progress,
+                    "state_complexity": {
+                        "chain_depth": index,
+                        "zone_transition_events": 0,
+                        "historical_public_activation_count": 0,
+                    },
+                    "ground_truth": {},
+                }
+            )
+    pilot = _select_state_samples(candidates, 24)
+    formal = _select_state_samples(candidates, 48)
+    assert [row["sample_id"] for row in formal[:24]] == [
+        row["sample_id"] for row in pilot
+    ]
+    assert set(Counter(row["state_sampling_stratum"] for row in formal).values()) == {6}
+
+
+def test_budget_forecast_sampling_is_balanced_and_prefix_extendable() -> None:
+    candidates = [
+        {
+            "sample_id": f"{label}-{index}",
+            "game_id": f"g-{label}-{index}",
+            "joint_stratum": label,
+        }
+        for label in ("A0B0", "A1B0", "A1B1")
+        for index in range(40)
+    ]
+    pilot = _select_forecast_samples(candidates, max_samples=45, sampling="stratified")
+    formal = _select_forecast_samples(candidates, max_samples=90, sampling="stratified")
+    assert [row["sample_id"] for row in formal[:45]] == [
+        row["sample_id"] for row in pilot
+    ]
+    assert Counter(row["joint_stratum"] for row in formal) == {
+        "A0B0": 30,
+        "A1B0": 30,
+        "A1B1": 30,
+    }
 
 
 def test_exp2_has_no_cox_output() -> None:

@@ -16,7 +16,7 @@ from ygobench.experiments.statistics import (
     rate,
 )
 
-METRIC_SCHEMA_VERSION = "2.0.0"
+METRIC_SCHEMA_VERSION = "3.0.0"
 
 
 def _identity(outcome: dict[str, Any], seat: int) -> tuple[str, str, str]:
@@ -75,7 +75,7 @@ def arena_metrics(
     *,
     include_bootstrap: bool = True,
 ) -> dict[str, Any]:
-    strict = [outcome for outcome in outcomes if outcome.get("competitive_eligible", False)]
+    rated = [outcome for outcome in outcomes if outcome.get("competitive_eligible", False)]
     rows_by_game_seat: dict[tuple[str, int], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
         rows_by_game_seat[(str(row["game_id"]), int(row["player"]))].append(row)
@@ -95,6 +95,8 @@ def arena_metrics(
                     "engine_completed": 0,
                     "strict_games": 0,
                     "strict_wins": 0,
+                    "rated_games": 0,
+                    "rated_wins": 0,
                     "first_games": 0,
                     "first_wins": 0,
                     "second_games": 0,
@@ -113,9 +115,11 @@ def arena_metrics(
             item["engine_completed"] += int(outcome.get("termination") == "game_over")
             eligible = bool(outcome.get("competitive_eligible", False))
             item["strict_games"] += int(eligible)
+            item["rated_games"] += int(eligible)
             if eligible:
                 won = int(outcome.get("winner") == seat)
                 item["strict_wins"] += won
+                item["rated_wins"] += won
                 position = "first" if seat == 0 else "second"
                 item[f"{position}_games"] += 1
                 item[f"{position}_wins"] += won
@@ -137,7 +141,7 @@ def arena_metrics(
     ratings = {policy: GlickoPlayer() for policy in policies}
     rating_games = [
         outcome
-        for outcome in strict
+        for outcome in rated
         if outcome_policy_id(outcome, 0) != outcome_policy_id(outcome, 1)
     ]
     if len(policies) >= 2 and rating_games:
@@ -155,7 +159,7 @@ def arena_metrics(
         glicko = {
             "status": "COMPUTED",
             "rated_games": len(rating_games),
-            "rating_period": "all strict games in deterministic game_id order",
+            "rating_period": "all competitively eligible games in deterministic game_id order",
             "initial": {"rating": 1500.0, "deviation": 350.0, "volatility": 0.06},
             "tau": 0.5,
         }
@@ -163,7 +167,7 @@ def arena_metrics(
         glicko = {
             "status": "INSUFFICIENT_OPPONENT_DIVERSITY",
             "rated_games": 0,
-            "reason": "at least two exact policy identities must meet in strict games",
+            "reason": "at least two exact policy identities must meet in rated games",
         }
 
     leaderboard = []
@@ -228,6 +232,7 @@ def arena_metrics(
                 "paired_unit_id": key,
                 "games_observed": len(games),
                 "strict_games": sum(game.get("competitive_eligible", False) for game in games),
+                "rated_games": sum(game.get("competitive_eligible", False) for game in games),
                 "seat_directions": {
                     "__vs__".join(direction): count
                     for direction, count in sorted(directions.items())
@@ -238,7 +243,7 @@ def arena_metrics(
         )
 
     matchup: dict[tuple[str, str, str], Counter[str]] = defaultdict(Counter)
-    for outcome in strict:
+    for outcome in rated:
         for seat in (0, 1):
             policy = outcome_policy_id(outcome, seat)
             key = (policy, str(outcome["decks"][seat]), str(outcome["decks"][1 - seat]))
@@ -255,10 +260,24 @@ def arena_metrics(
         "status": "COMPLETED" if outcomes else "INSUFFICIENT_DATA",
         "protocol": "full_duel_arena",
         "games_observed": len(outcomes),
-        "strict_games": len(strict),
+        # Backward-compatible alias; schema v3 defines this as the rated set,
+        # not as "zero recovered model errors".
+        "strict_games": len(rated),
+        "rated_games": len(rated),
+        "rated_model_forfeits": sum(
+            outcome.get("termination") == "model_retry_exhausted_forfeit"
+            for outcome in rated
+        ),
         "eligibility_exclusions": dict(
             Counter(
                 outcome.get("termination", "unknown")
+                for outcome in outcomes
+                if not outcome.get("competitive_eligible", False)
+            )
+        ),
+        "technical_exclusions": dict(
+            Counter(
+                outcome.get("technical_failure_type") or outcome.get("termination", "unknown")
                 for outcome in outcomes
                 if not outcome.get("competitive_eligible", False)
             )
@@ -295,7 +314,7 @@ def arena_metrics(
                 {
                     "seat": seat,
                     **proportion(
-                        sum(outcome.get("winner") == seat for outcome in strict), len(strict)
+                        sum(outcome.get("winner") == seat for outcome in rated), len(rated)
                     ),
                 }
                 for seat in (0, 1)
@@ -727,9 +746,6 @@ def execution_metrics(
         item["retry_recovered"] += int(validation.get("recovery") == "corrected_retry")
         item["retry_exhausted"] += int(bool(validation.get("terminal_model_failure")))
         item["fallbacks"] += int(bool(row.get("trace", {}).get("fallback")))
-        item["deterministic_engine_fallbacks"] += int(
-            validation.get("recovery") == "deterministic_fallback_after_engine_error"
-        )
         item["exact_legal_rejections"] += int(bool(validation.get("pre_engine_error")))
         item["engine_rejections"] += int(
             bool(validation.get("engine_rejection_error") or validation.get("engine_error"))
@@ -820,9 +836,6 @@ def execution_metrics(
                 "retry_recovery_rate": rate(item["retry_recovered"], item["invalid"]),
                 "retry_exhausted_rate": rate(item["retry_exhausted"], decisions),
                 "fallbacks_per_100_decisions": rate(100 * item["fallbacks"], decisions),
-                "deterministic_engine_fallbacks_per_100_decisions": rate(
-                    100 * item["deterministic_engine_fallbacks"], decisions
-                ),
                 "exact_legal_rejection_rate": rate(item["exact_legal_rejections"], decisions),
                 "engine_rejection_rate": rate(item["engine_rejections"], decisions),
                 "tool_calls_per_decision": rate(item["tool_calls"], decisions),
@@ -871,6 +884,18 @@ def execution_metrics(
         "termination_reasons": {
             policy: dict(sorted(counts.items())) for policy, counts in sorted(terminations.items())
         },
+        "outcome_failure_domains": dict(
+            sorted(
+                Counter(
+                    "model_error"
+                    if outcome.get("termination") == "model_retry_exhausted_forfeit"
+                    else str(outcome.get("technical_failure_type"))
+                    if outcome.get("technical_failure_type")
+                    else "none"
+                    for outcome in outcomes
+                ).items()
+            )
+        ),
         "invalid_action_rate_by_responder_type": [
             {
                 "policy": key[0],
@@ -1104,6 +1129,60 @@ def state_metrics(rows: list[dict[str, Any]], *, include_bootstrap: bool = True)
             )
         return rate(correct, len(sampled))
 
+    def weighted_state_summary() -> dict[str, Any] | None:
+        weighted_rows = [
+            row
+            for row in rows
+            if isinstance(row.get("inclusion_probability"), (int, float))
+            and float(row["inclusion_probability"]) > 0
+        ]
+        if not weighted_rows:
+            return None
+        total_weight = joint_weight = scalar_weight = scalar_correct_weight = 0.0
+        weighted_sets: dict[str, Counter[str]] = defaultdict(Counter)
+        weight_squares = 0.0
+        for row in weighted_rows:
+            weight = 1.0 / float(row["inclusion_probability"])
+            total_weight += weight
+            weight_squares += weight**2
+            truth = row.get("ground_truth") if isinstance(row.get("ground_truth"), dict) else {}
+            prediction = row.get("prediction") if not _state_schema_errors(row) else {}
+            prediction = prediction if isinstance(prediction, dict) else {}
+            exact = bool(truth) and all(
+                _normal(prediction.get(key)) == _normal(expected)
+                for key, expected in truth.items()
+            )
+            joint_weight += weight * int(exact)
+            for key, expected in truth.items():
+                predicted = prediction.get(key)
+                if isinstance(expected, list):
+                    predicted_list = predicted if isinstance(predicted, list) else []
+                    tp, fp, fn, _ = _f1(expected, [str(item) for item in predicted_list])
+                    weighted_sets[key]["tp"] += weight * tp
+                    weighted_sets[key]["fp"] += weight * fp
+                    weighted_sets[key]["fn"] += weight * fn
+                else:
+                    scalar_weight += weight
+                    scalar_correct_weight += weight * int(predicted == expected)
+        micro_tp = sum(counts["tp"] for counts in weighted_sets.values())
+        micro_fp = sum(counts["fp"] for counts in weighted_sets.values())
+        micro_fn = sum(counts["fn"] for counts in weighted_sets.values())
+        field_f1 = [
+            rate(2 * counts["tp"], 2 * counts["tp"] + counts["fp"] + counts["fn"])
+            for counts in weighted_sets.values()
+        ]
+        valid_field_f1 = [value for value in field_f1 if value is not None]
+        return {
+            "jga": rate(joint_weight, total_weight),
+            "slot_accuracy": rate(scalar_correct_weight, scalar_weight),
+            "slot_micro_f1": rate(2 * micro_tp, 2 * micro_tp + micro_fp + micro_fn),
+            "slot_macro_f1": rate(sum(valid_field_f1), len(valid_field_f1)),
+            "sum_weights": total_weight,
+            "effective_sample_size": (
+                total_weight**2 / weight_squares if weight_squares else None
+            ),
+        }
+
     bootstrap_rows = [{**row, "game_id": str(row.get("game_id", "unknown"))} for row in rows]
     return {
         "schema_version": METRIC_SCHEMA_VERSION,
@@ -1122,6 +1201,7 @@ def state_metrics(rows: list[dict[str, Any]], *, include_bootstrap: bool = True)
         "valid_only_jga": rate(valid_joint, len(valid)),
         "slot_accuracy": rate(e2e_scalar_correct, e2e_scalar_total),
         "valid_only_slot_accuracy": rate(scalar_correct, scalar_total),
+        "natural_distribution_weighted": weighted_state_summary(),
         "slot_f1": {
             "micro_f1": rate(2 * e2e_tp, 2 * e2e_tp + e2e_fp + e2e_fn),
             "macro_f1": rate(sum(set_field_f1), len(set_field_f1)),

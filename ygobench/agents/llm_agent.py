@@ -11,11 +11,9 @@ from typing import Any
 
 from ygobench.agents.base import BaseAgent
 from ygobench.agents.provider_limits import (
-    force_deepseek_thinking_mode,
-    force_qwen_thinking_mode,
+    force_provider_thinking_disabled,
     force_single_tool_call,
     omit_provider_token_limit,
-    omit_reasoning_model_token_limit,
     scrub_reasoning_content,
 )
 from ygobench.config import ModelConfig
@@ -330,13 +328,13 @@ class LLMFullDuelAgent(BaseAgent):
         max_tokens: int | None = None,
         temperature: float = 0.0,
         max_forced_retries: int = MAX_MODEL_ACTION_ATTEMPTS - 1,
-        thinking_enabled: bool = True,
+        thinking_enabled: bool = False,
         profile: str = "react",
     ) -> None:
         tools_module, get_provider = _provider_runtime()
         kwargs: dict[str, Any] = {"temperature": temperature}
         if max_tokens is not None:
-            kwargs["max_tokens"] = max_tokens
+            raise ValueError("Formal YGO-Bench runs must omit the provider token limit")
         if model.base_url:
             kwargs["base_url"] = model.base_url
         if model.api_key:
@@ -349,22 +347,15 @@ class LLMFullDuelAgent(BaseAgent):
             # experiment's recorded thinking profile.
             kwargs["thinking_enabled"] = thinking_enabled
         self._provider = get_provider(backend, model.model, **kwargs)
-        if backend in {"deepseek", "dashscope"} and max_tokens is None:
-            omit_reasoning_model_token_limit(self._provider)
-        if qwen_compatible and max_tokens is None:
-            omit_provider_token_limit(self._provider)
+        omit_provider_token_limit(self._provider)
         # DashScope's documented compatible-mode example does not expose this
         # optional OpenAI flag.  Prompt/schema validation enforce one action,
         # while avoiding a provider-specific unsupported request parameter.
         if backend != "dashscope" and not qwen_compatible:
             force_single_tool_call(self._provider)
-        if backend in {"deepseek", "dashscope"} and not thinking_enabled:
-            self._provider.reasoning_effort = None
-            self._provider.thinking_enabled = False
-        if backend == "deepseek":
-            force_deepseek_thinking_mode(self._provider, enabled=thinking_enabled)
-        if qwen_compatible:
-            force_qwen_thinking_mode(self._provider, enabled=thinking_enabled)
+        if thinking_enabled:
+            raise ValueError("Formal YGO-Bench runs require thinking_enabled=False")
+        force_provider_thinking_disabled(self._provider, provider_name=model.provider)
         self._tool_defs = {tool["name"]: tool for tool in tools_module.TOOLS}
         # Full-duel tool protocol v3 replaces repeated single-card lookups with
         # exactly one batch-inspection round per engine decision.
@@ -378,7 +369,15 @@ class LLMFullDuelAgent(BaseAgent):
         self.name = f"{profile}:{model.provider}:{model.model}"
         self.provider_config = self._provider.provider_config_for_log()
         self.provider_config["profile"] = profile
-        self.provider_config["thinking_enabled"] = thinking_enabled
+        self.provider_config["thinking_enabled"] = False
+        self.provider_config["thinking_control"] = getattr(
+            self._provider, "_ygobench_thinking_control", None
+        )
+        self.provider_config["reasoning_effort"] = getattr(
+            self._provider, "reasoning_effort", None
+        )
+        self.provider_config["max_tokens"] = None
+        self.provider_config["token_limit_policy"] = "omitted_from_request"
         self.usage: dict[str, float] = {}
         self.model_calls = 0
         self.invalid_outputs = 0
@@ -554,6 +553,8 @@ class LLMFullDuelAgent(BaseAgent):
                         "size_after": len(card_cache),
                     },
                     "fallback": False,
+                    "model_action_attempts": forced_retries + 1,
+                    "action_protocol_retries": forced_retries,
                 }
                 return ActionChoice(
                     tool=action_call.name,

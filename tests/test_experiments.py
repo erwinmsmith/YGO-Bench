@@ -2,9 +2,14 @@ import json
 import sys
 from types import SimpleNamespace
 
-from ygobench.agents.llm_agent import _tool_protocol_diagnostics, exact_legal_actions_packet
+from ygobench.agents.llm_agent import (
+    ProviderCallError,
+    _tool_protocol_diagnostics,
+    exact_legal_actions_packet,
+)
 from ygobench.agents.provider_limits import (
     force_deepseek_thinking_mode,
+    force_openai_thinking_disabled,
     force_provider_thinking_disabled,
     force_single_tool_call,
     omit_deepseek_token_limit,
@@ -13,6 +18,7 @@ from ygobench.agents.provider_limits import (
 )
 from ygobench.engine.protocol import ActionChoice
 from ygobench.experiments import probes
+import ygobench.experiments.runner as runner_module
 from ygobench.experiments.capabilities import inspect_capabilities
 from ygobench.experiments.config import ExperimentConfig, stable_id
 from ygobench.experiments.io import JsonlJournal
@@ -250,6 +256,11 @@ def test_exact_legal_gate_forfeits_after_model_retries_are_exhausted(tmp_path) -
     row = JsonlJournal(config.game_dir(tmp_path) / "trajectory.jsonl").recover()[0]
     assert outcome["termination"] == "model_retry_exhausted_forfeit"
     assert outcome["winner"] == 1
+    assert outcome["competitive_eligible"] is True
+    assert outcome["technical_valid"] is True
+    assert outcome["forfeit_player"] == 0
+    assert outcome["adjudication"]["kind"] == "rated_model_forfeit"
+    assert outcome["final_lp"] == [8000, 8000]
     assert row["validation"]["pre_engine_error"].startswith(
         "action_not_in_exact_legal_set"
     )
@@ -285,6 +296,90 @@ def test_exact_legal_gate_accepts_exact_initial_chain_response(tmp_path) -> None
     assert row["validation"]["valid"] is True
     assert row["validation"]["pre_engine_error"] is None
     assert row["validation"]["engine_submission_attempted"] is True
+
+
+def test_provider_failure_is_unrated_and_keeps_retryable_prefix(monkeypatch, tmp_path) -> None:
+    class FailingAgent:
+        name = "react-fast:test:model"
+        provider_config = {
+            "provider": "test",
+            "model": "model",
+            "thinking_enabled": False,
+            "max_tokens": None,
+        }
+        last_trace = {"transport_attempts": []}
+
+        def reset(self):
+            self.last_trace = {"transport_attempts": []}
+
+        def predict(self, _request):
+            attempts = [
+                {"attempt": index, "outcome": "error", "error_type": "TimeoutError"}
+                for index in (1, 2, 3)
+            ]
+            raise ProviderCallError(TimeoutError("network"), attempts)
+
+    monkeypatch.setattr(runner_module, "create_agent", lambda *_args, **_kwargs: FailingAgent())
+    config = ExperimentConfig.build(
+        run_id="api-failure-separation",
+        deck1="BlueEyes",
+        deck2="BlueEyes",
+        agent1="react-fast:test:model",
+        agent2="react-fast:test:model",
+        seed=31,
+        max_decisions=1,
+    )
+    outcome = run_evidence_duel(config, root=tmp_path)
+    game_dir = config.game_dir(tmp_path)
+
+    assert outcome["termination"] == "api_failure_abort"
+    assert outcome["competitive_eligible"] is False
+    assert outcome["technical_failure_type"] == "api_failure"
+    assert outcome["winner"] is None
+    assert outcome["final_lp"] == [8000, 8000]
+    assert JsonlJournal(game_dir / "trajectory.jsonl").recover() == []
+    failures = JsonlJournal(game_dir / "technical_failures.jsonl").recover()
+    assert len(failures) == 1
+    assert failures[0]["validation"]["api_error"]
+    assert TaskRegistry(tmp_path / config.run_id / "task_state.sqlite").row(config.game_id)[
+        "status"
+    ] == "FAILED_RETRYABLE"
+
+
+def test_engine_failure_has_no_deterministic_action_fallback(monkeypatch, tmp_path) -> None:
+    def fail_execute(_self, _action):
+        raise RuntimeError("engine exploded")
+
+    monkeypatch.setattr(runner_module.DuelSession, "execute", fail_execute)
+    config = ExperimentConfig.build(
+        run_id="engine-failure-separation",
+        deck1="BlueEyes",
+        deck2="BlueEyes",
+        agent1="passive",
+        agent2="passive",
+        seed=29,
+        max_decisions=1,
+    )
+    outcome = run_evidence_duel(
+        config,
+        root=tmp_path,
+        interventions={0: ActionChoice("select_chain", {"index": None})},
+    )
+    game_dir = config.game_dir(tmp_path)
+
+    assert outcome["termination"] == "engine_failure_abort"
+    assert outcome["competitive_eligible"] is False
+    assert outcome["technical_failure_type"] == "engine_failure"
+    assert outcome["winner"] is None
+    assert JsonlJournal(game_dir / "trajectory.jsonl").recover() == []
+    failures = JsonlJournal(game_dir / "technical_failures.jsonl").recover()
+    assert len(failures) == 1
+    assert failures[0]["executed_action"] == {
+        "arguments": {"index": None},
+        "label": "",
+        "tool": "select_chain",
+    }
+    assert failures[0]["validation"]["recovery"] == "none"
 
 
 def test_deepseek_requests_omit_token_limit() -> None:
@@ -433,6 +528,32 @@ def test_dashscope_probe_requests_explicitly_disable_thinking() -> None:
     assert provider._client.chat.completions.create(model="qwen3.8-max") == "ok"
     assert captured["extra_body"] == {"enable_thinking": False}
     assert provider.thinking_enabled is False
+
+
+def test_openai_compatible_requests_are_uncapped_and_disable_thinking() -> None:
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    provider = SimpleNamespace(
+        name="openai",
+        max_tokens=4096,
+        _client=SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    omit_reasoning_model_token_limit(provider)
+    # The generic helper is what the duel/probe factories use for OpenAI-like
+    # endpoints; combine it with the generic uncapping helper in production.
+    from ygobench.agents.provider_limits import omit_provider_token_limit
+
+    omit_provider_token_limit(provider)
+    force_openai_thinking_disabled(provider)
+    assert provider._client.chat.completions.create(max_tokens=4096) == "ok"
+    assert "max_tokens" not in captured
+    assert captured["reasoning_effort"] == "none"
 
 
 def test_reasoning_content_is_removed_recursively() -> None:

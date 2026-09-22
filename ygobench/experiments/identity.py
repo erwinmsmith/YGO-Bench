@@ -6,14 +6,15 @@ from typing import Any
 
 from ygobench.experiments.config import stable_id
 
-POLICY_IDENTITY_VERSION = "2.0.0"
+POLICY_IDENTITY_VERSION = "3.0.0"
 TOOL_SCHEMA_VERSION = "full-duel-tools-v4-batch-inspection-cache"
 CONTEXT_POLICY = "compact-public-state-with-duel-card-cache-v2"
 RETRY_POLICY = {
     "model_action_attempts": 3,
     "provider_attempts": 3,
     "provider_retry_delays_seconds": [10.0, 10.0],
-    "failure_action": "forfeit",
+    "model_failure_action": "rated_forfeit",
+    "technical_failure_action": "unrated_abort",
 }
 
 
@@ -34,8 +35,9 @@ def policy_descriptor(
         "profile": profile,
         "provider": provider,
         "model": model,
-        "thinking_enabled": profile == "react",
-        "reasoning_mode": "provider_default" if profile == "react" else "disabled",
+        "thinking_enabled": False,
+        "reasoning_mode": "disabled",
+        "token_limit_policy": "omitted_from_request",
         "prompt_hashes": dict(sorted((prompt_hashes or {}).items())),
         "tool_schema_version": TOOL_SCHEMA_VERSION,
         "retry_policy": RETRY_POLICY,
@@ -52,15 +54,17 @@ def policy_descriptor(
             "backend",
             "profile",
             "thinking_enabled",
+            "thinking_control",
             "reasoning_effort",
             "temperature",
             "max_tokens",
+            "token_limit_policy",
         ):
             if key in runtime:
                 descriptor[f"runtime_{key}"] = runtime[key]
         if "thinking_enabled" in runtime:
             descriptor["thinking_enabled"] = bool(runtime["thinking_enabled"])
-        if runtime.get("reasoning_effort"):
+        if runtime.get("reasoning_effort") not in (None, "none", "off", "disabled"):
             descriptor["reasoning_mode"] = str(runtime["reasoning_effort"])
     return descriptor
 
@@ -75,9 +79,13 @@ def model_configuration_id(descriptor: dict[str, Any]) -> str:
         "provider": descriptor.get("runtime_provider", descriptor.get("provider")),
         "model": descriptor.get("runtime_model", descriptor.get("model")),
         "thinking_enabled": descriptor.get("thinking_enabled"),
-        "reasoning_mode": descriptor.get("reasoning_mode"),
+        "reasoning_mode": "disabled"
+        if descriptor.get("reasoning_mode") in (None, "none", "off", "disabled")
+        else descriptor.get("reasoning_mode"),
         "temperature": descriptor.get("runtime_temperature"),
-        "max_tokens": descriptor.get("runtime_max_tokens"),
+        "token_limit_policy": descriptor.get(
+            "runtime_token_limit_policy", descriptor.get("token_limit_policy")
+        ),
     }
     return stable_id("modelcfg", value, length=24)
 

@@ -29,7 +29,7 @@ class ExperimentConfig:
     seed: int
     max_decisions: int = 0
     # The schema version changes only when persisted evidence compatibility changes.
-    schema_version: str = "2.0.0"
+    schema_version: str = "3.0.0"
     checkpoint_interval: int = 25
     resume: bool = True
 

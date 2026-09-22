@@ -27,7 +27,11 @@ def create_agent(agent_id: str, *, seed: int = 0) -> BaseAgent:
         parts = agent_id.split(":", 2)
         provider = parts[1] if len(parts) > 1 and parts[1] else None
         model = parts[2] if len(parts) > 2 and parts[2] else None
-        return LLMFullDuelAgent(default_model_config(provider, model))
+        return LLMFullDuelAgent(
+            default_model_config(provider, model),
+            thinking_enabled=False,
+            profile="react",
+        )
     raise ValueError(
         f"Unknown full-duel agent {agent_id!r}; use passive, random, "
         "react[:provider:model], or react-fast[:provider:model]."
