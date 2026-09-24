@@ -276,7 +276,8 @@ class ProviderCallError(RuntimeError):
     def __init__(self, cause: Exception, attempts: list[dict[str, Any]]) -> None:
         self.attempts = attempts
         self.cause_type = type(cause).__name__
-        super().__init__(f"{self.cause_type}: provider connection retries exhausted")
+        self.cause_message = str(cause)
+        super().__init__(f"{self.cause_type}: {self.cause_message}")
 
 
 def _tool_protocol_diagnostics(messages: list[dict[str, Any]]) -> dict[str, Any]:

@@ -2,6 +2,7 @@ import json
 import sys
 from types import SimpleNamespace
 
+import ygobench.experiments.runner as runner_module
 from ygobench.agents.llm_agent import (
     ProviderCallError,
     _tool_protocol_diagnostics,
@@ -19,7 +20,6 @@ from ygobench.agents.provider_limits import (
 )
 from ygobench.engine.protocol import ActionChoice
 from ygobench.experiments import probes
-import ygobench.experiments.runner as runner_module
 from ygobench.experiments.capabilities import inspect_capabilities
 from ygobench.experiments.config import ExperimentConfig, stable_id
 from ygobench.experiments.io import JsonlJournal
@@ -631,9 +631,49 @@ def test_gagawenai_gemini_adapts_messages_tools_and_usage() -> None:
         "name": "inspect_cards",
         "args": {"card_ids": [1]},
     }
+    assert contents[1]["parts"][0]["thoughtSignature"] == (
+        "skip_thought_signature_validator"
+    )
+    assert captured["messages"][2]["tool_calls"][0]["extra_content"] == {
+        "google": {"thought_signature": "skip_thought_signature_validator"}
+    }
     assert contents[2]["parts"][0]["functionResponse"]["name"] == "inspect_cards"
 
 
+def test_gagawenai_gemini_adapts_ygo_tool_schema() -> None:
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(usage=None)
+
+    provider = SimpleNamespace(
+        name="openai",
+        _client=SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    adapt_gagawenai_gemini(provider)
+    provider._client.chat.completions.create(
+        model="gemini-3.7-flash",
+        messages=[{"role": "user", "content": "调用 select_chain"}],
+        tools=[
+            {
+                "name": "select_chain",
+                "description": "Select one legal chain action.",
+                "input_schema": {
+                    "type": "object",
+                    "uniqueItems": True,
+                    "properties": {"index": {"type": "integer"}},
+                    "required": ["index"],
+                },
+            }
+        ],
+    )
+
+    declaration = captured["extra_body"]["tools"][0]["functionDeclarations"][0]
+    assert declaration["name"] == "select_chain"
+    assert declaration["parameters"]["required"] == ["index"]
 def test_gagawenai_gemini_thinking_policy_does_not_block_diagnostic_runs() -> None:
     provider = SimpleNamespace(name="gagawenai-gemini")
     assert force_provider_thinking_disabled(

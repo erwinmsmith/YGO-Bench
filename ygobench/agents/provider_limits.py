@@ -66,7 +66,17 @@ def _gagawenai_gemini_payload(
                     arguments = {}
                 if call_id:
                     tool_names[call_id] = name
-                parts.append({"functionCall": {"name": name, "args": arguments}})
+                parts.append(
+                    {
+                        "functionCall": {
+                            "name": name,
+                            "args": arguments,
+                        },
+                        # The OpenAI-compatible gateway drops Gemini response signatures.
+                        # Google documents this placeholder for replayed function calls.
+                        "thoughtSignature": "skip_thought_signature_validator",
+                    }
+                )
             if parts:
                 contents.append({"role": "model", "parts": parts})
             continue
@@ -98,16 +108,43 @@ def _gagawenai_gemini_payload(
     if system_parts:
         payload["systemInstruction"] = {"parts": system_parts}
 
+    def normalize_schema(value: Any) -> Any:
+        if isinstance(value, Mapping):
+            normalized: dict[str, Any] = {}
+            for key, item in value.items():
+                if key == "uniqueItems":
+                    continue
+                if key == "type" and isinstance(item, list):
+                    non_null = [schema_type for schema_type in item if schema_type != "null"]
+                    if len(non_null) == 1:
+                        normalized["type"] = non_null[0]
+                        if "null" in item:
+                            normalized["nullable"] = True
+                        continue
+                normalized[key] = normalize_schema(item)
+            return normalized
+        if isinstance(value, list):
+            return [normalize_schema(item) for item in value]
+        return value
+
     declarations: list[dict[str, Any]] = []
     for tool in tools or []:
         function = tool.get("function") or {}
-        if not function.get("name"):
+        if function:
+            name = function.get("name")
+            description = function.get("description", "")
+            parameters = function.get("parameters")
+        else:
+            name = tool.get("name")
+            description = tool.get("description", "")
+            parameters = tool.get("input_schema")
+        if not name:
             continue
         declarations.append(
             {
-                "name": function["name"],
-                "description": function.get("description", ""),
-                "parameters": function.get("parameters")
+                "name": name,
+                "description": description,
+                "parameters": normalize_schema(parameters)
                 or {"type": "object", "properties": {}},
             }
         )
@@ -115,6 +152,31 @@ def _gagawenai_gemini_payload(
         payload["tools"] = [{"functionDeclarations": declarations}]
         payload["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
     return payload
+
+
+def _gemini_messages_with_thought_signatures(
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Add the documented Gemini signature placeholder to tool-call history."""
+
+    enriched: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            enriched.append(message)
+            continue
+        updated = dict(message)
+        calls: list[dict[str, Any]] = []
+        for raw_call in message.get("tool_calls", []) or []:
+            call = dict(raw_call)
+            extra_content = dict(call.get("extra_content") or {})
+            google = dict(extra_content.get("google") or {})
+            google.setdefault("thought_signature", "skip_thought_signature_validator")
+            extra_content["google"] = google
+            call["extra_content"] = extra_content
+            calls.append(call)
+        updated["tool_calls"] = calls
+        enriched.append(updated)
+    return enriched
 
 
 def adapt_gagawenai_gemini(provider: Any) -> Any:
@@ -132,7 +194,9 @@ def adapt_gagawenai_gemini(provider: Any) -> Any:
             raise ValueError("Gagawenai Gemini requests require an OpenAI messages list")
         raw_tools = kwargs.pop("tools", None)
         tools = raw_tools if isinstance(raw_tools, list) else None
-        native = _gagawenai_gemini_payload(raw_messages, tools)
+        messages = _gemini_messages_with_thought_signatures(raw_messages)
+        kwargs["messages"] = messages
+        native = _gagawenai_gemini_payload(messages, tools)
         raw_extra = kwargs.get("extra_body")
         extra = dict(raw_extra) if isinstance(raw_extra, Mapping) else {}
         extra.update(native)
