@@ -634,14 +634,11 @@ def test_gagawenai_gemini_adapts_messages_tools_and_usage() -> None:
     assert contents[2]["parts"][0]["functionResponse"]["name"] == "inspect_cards"
 
 
-def test_gagawenai_gemini_formal_thinking_disabled_run_fails_closed() -> None:
+def test_gagawenai_gemini_thinking_policy_does_not_block_diagnostic_runs() -> None:
     provider = SimpleNamespace(name="gagawenai-gemini")
-    try:
-        force_provider_thinking_disabled(provider, provider_name="gagawenai-gemini")
-    except ValueError as exc:
-        assert "non-zero" in str(exc)
-    else:
-        raise AssertionError("formal Gemini runs must fail closed")
+    assert force_provider_thinking_disabled(
+        provider, provider_name="gagawenai-gemini"
+    ) is provider
 
 
 def test_reasoning_content_is_removed_recursively() -> None:

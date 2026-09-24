@@ -372,7 +372,11 @@ class LLMFullDuelAgent(BaseAgent):
         self.name = f"{profile}:{model.provider}:{model.model}"
         self.provider_config = self._provider.provider_config_for_log()
         self.provider_config["profile"] = profile
-        self.provider_config["thinking_enabled"] = False
+        # Preserve the provider's actual default when no verified off switch
+        # exists, instead of claiming that thinking was disabled.
+        self.provider_config["thinking_enabled"] = bool(
+            getattr(self._provider, "thinking_enabled", thinking_enabled)
+        )
         self.provider_config["thinking_control"] = getattr(
             self._provider, "_ygobench_thinking_control", None
         )

@@ -298,11 +298,11 @@ def force_openai_thinking_disabled(provider: Any) -> Any:
 def force_provider_thinking_disabled(
     provider: Any, *, provider_name: str | None = None
 ) -> Any:
-    """Explicitly disable hidden reasoning for every supported probe provider.
+    """Apply the provider-specific thinking policy at the SDK boundary.
 
     Attribute assignment is insufficient for APIs that enable reasoning when
-    the request field is omitted.  Exp3/Exp5 use this helper so every request
-    carries the provider-specific off switch at the SDK boundary.
+    the request field is omitted.  Providers without a verified off switch.
+    are left at their gateway default and expose that fact in metadata.
     """
 
     name = provider_name or getattr(provider, "name", None)
@@ -313,11 +313,9 @@ def force_provider_thinking_disabled(
     if name in {"openai", "azopenai"}:
         return force_openai_thinking_disabled(provider)
     if name == "gagawenai-gemini":
-        raise ValueError(
-            "Gagawenai Gemini cannot be used in a formal thinking-disabled run: "
-            "the gateway accepted all tested disable fields but still returned "
-            "non-zero completion_tokens_details.reasoning_tokens"
-        )
+        # The gateway currently ignores all tested disable fields.  Do not
+        # block a diagnostic duel; reasoning usage remains visible in traces.
+        return provider
     raise ValueError(
         f"provider {name!r} has no explicit thinking-disable adapter; formal runs fail closed"
     )

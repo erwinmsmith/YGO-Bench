@@ -64,6 +64,8 @@ def policy_descriptor(
                 descriptor[f"runtime_{key}"] = runtime[key]
         if "thinking_enabled" in runtime:
             descriptor["thinking_enabled"] = bool(runtime["thinking_enabled"])
+            if runtime["thinking_enabled"]:
+                descriptor["reasoning_mode"] = "provider-default"
         if runtime.get("reasoning_effort") not in (None, "none", "off", "disabled"):
             descriptor["reasoning_mode"] = str(runtime["reasoning_effort"])
     return descriptor
