@@ -24,3 +24,15 @@ def test_bailian_qwen_uses_explicit_thinking_provider(monkeypatch) -> None:
     assert config.backend == "openai"
     assert config.model == "qwen3.7-flash"
     assert config.api_key == "test-key"
+
+
+def test_gagawenai_gemini_uses_isolated_profile(monkeypatch) -> None:
+    monkeypatch.setenv("GAGAWENAI_GEMINI_API_KEY", "test-gemini-key")
+    monkeypatch.setenv("GAGAWENAI_GEMINI_BASE_URL", "https://gemini.example/v1")
+    config = default_model_config("gagawenai-gemini", "gemini-3.7-flash")
+    assert config.provider == "gagawenai-gemini"
+    assert config.backend == "openai"
+    assert config.model == "gemini-3.7-flash"
+    assert config.api_key == "test-gemini-key"
+    assert config.base_url == "https://gemini.example/v1"
+    assert missing_api_key(config) is None

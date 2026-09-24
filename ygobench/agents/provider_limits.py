@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections.abc import Mapping, Sequence
 from functools import wraps
 from typing import Any
@@ -19,6 +20,143 @@ def scrub_reasoning_content(value: Any) -> Any:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [scrub_reasoning_content(item) for item in value]
     return value
+
+
+def _gagawenai_gemini_payload(
+    messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None
+) -> dict[str, Any]:
+    """Translate an OpenAI request into the extra Gemini-native fields.
+
+    The Gagawenai Gemini gateway currently validates both the OpenAI
+    ``messages`` envelope and Gemini-native ``contents``/``tools`` fields.
+    Keep the original OpenAI messages on the request and add a synchronized
+    native representation rather than changing the shared upstream provider.
+    """
+
+    contents: list[dict[str, Any]] = []
+    system_parts: list[dict[str, str]] = []
+    tool_names: dict[str, str] = {}
+
+    for message in messages:
+        role = str(message.get("role", ""))
+        content = message.get("content")
+        if role == "system":
+            if content:
+                system_parts.append({"text": str(content)})
+            continue
+        if role == "user":
+            contents.append(
+                {"role": "user", "parts": [{"text": str(content or "")}]}
+            )
+            continue
+        if role == "assistant":
+            parts: list[dict[str, Any]] = []
+            if content:
+                parts.append({"text": str(content)})
+            for call in message.get("tool_calls", []) or []:
+                function = call.get("function") or {}
+                name = str(function.get("name", ""))
+                call_id = str(call.get("id", ""))
+                raw_arguments = function.get("arguments", "{}")
+                try:
+                    arguments = json.loads(raw_arguments or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    arguments = {}
+                if not isinstance(arguments, dict):
+                    arguments = {}
+                if call_id:
+                    tool_names[call_id] = name
+                parts.append({"functionCall": {"name": name, "args": arguments}})
+            if parts:
+                contents.append({"role": "model", "parts": parts})
+            continue
+        if role == "tool":
+            call_id = str(message.get("tool_call_id", ""))
+            name = tool_names.get(call_id, "tool_result")
+            raw_result = content or ""
+            try:
+                response = json.loads(raw_result) if isinstance(raw_result, str) else raw_result
+            except json.JSONDecodeError:
+                response = {"result": str(raw_result)}
+            if not isinstance(response, Mapping):
+                response = {"result": response}
+            contents.append(
+                {
+                    "role": "user",
+                    "parts": [
+                        {
+                            "functionResponse": {
+                                "name": name,
+                                "response": dict(response),
+                            }
+                        }
+                    ],
+                }
+            )
+
+    payload: dict[str, Any] = {"contents": contents}
+    if system_parts:
+        payload["systemInstruction"] = {"parts": system_parts}
+
+    declarations: list[dict[str, Any]] = []
+    for tool in tools or []:
+        function = tool.get("function") or {}
+        if not function.get("name"):
+            continue
+        declarations.append(
+            {
+                "name": function["name"],
+                "description": function.get("description", ""),
+                "parameters": function.get("parameters")
+                or {"type": "object", "properties": {}},
+            }
+        )
+    if declarations:
+        payload["tools"] = [{"functionDeclarations": declarations}]
+        payload["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
+    return payload
+
+
+def adapt_gagawenai_gemini(provider: Any) -> Any:
+    """Adapt OpenAI SDK requests to Gagawenai's Gemini gateway contract."""
+
+    if getattr(provider, "_ygobench_gagawenai_gemini", False):
+        return provider
+    completions = provider._client.chat.completions
+    create = completions.create
+
+    @wraps(create)
+    def create_with_gemini_payload(*args: Any, **kwargs: Any) -> Any:
+        raw_messages = kwargs.get("messages")
+        if not isinstance(raw_messages, list):
+            raise ValueError("Gagawenai Gemini requests require an OpenAI messages list")
+        raw_tools = kwargs.pop("tools", None)
+        tools = raw_tools if isinstance(raw_tools, list) else None
+        native = _gagawenai_gemini_payload(raw_messages, tools)
+        raw_extra = kwargs.get("extra_body")
+        extra = dict(raw_extra) if isinstance(raw_extra, Mapping) else {}
+        extra.update(native)
+        kwargs["extra_body"] = extra
+        # These OpenAI-only controls are rejected or ignored by the gateway.
+        kwargs.pop("parallel_tool_calls", None)
+        kwargs.pop("reasoning_effort", None)
+        response = create(*args, **kwargs)
+        usage = getattr(response, "usage", None)
+        details = getattr(usage, "completion_tokens_details", None)
+        reasoning_tokens = getattr(details, "reasoning_tokens", None)
+        if usage is not None and reasoning_tokens is not None:
+            try:
+                usage.reasoning_tokens = reasoning_tokens
+            except Exception:  # noqa: BLE001
+                object.__setattr__(usage, "reasoning_tokens", reasoning_tokens)
+        return response
+
+    completions.create = create_with_gemini_payload
+    provider.name = "gagawenai-gemini"
+    provider._ygobench_gagawenai_gemini = True
+    provider._ygobench_thinking_control = "unsupported-by-gateway"
+    provider.thinking_enabled = True
+    return provider
 
 
 def omit_reasoning_model_token_limit(provider: Any) -> Any:
@@ -174,6 +312,12 @@ def force_provider_thinking_disabled(
         return force_qwen_thinking_mode(provider, enabled=False)
     if name in {"openai", "azopenai"}:
         return force_openai_thinking_disabled(provider)
+    if name == "gagawenai-gemini":
+        raise ValueError(
+            "Gagawenai Gemini cannot be used in a formal thinking-disabled run: "
+            "the gateway accepted all tested disable fields but still returned "
+            "non-zero completion_tokens_details.reasoning_tokens"
+        )
     raise ValueError(
         f"provider {name!r} has no explicit thinking-disable adapter; formal runs fail closed"
     )

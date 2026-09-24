@@ -8,6 +8,7 @@ from ygobench.agents.llm_agent import (
     exact_legal_actions_packet,
 )
 from ygobench.agents.provider_limits import (
+    adapt_gagawenai_gemini,
     force_deepseek_thinking_mode,
     force_openai_thinking_disabled,
     force_provider_thinking_disabled,
@@ -554,6 +555,93 @@ def test_openai_compatible_requests_are_uncapped_and_disable_thinking() -> None:
     assert provider._client.chat.completions.create(max_tokens=4096) == "ok"
     assert "max_tokens" not in captured
     assert captured["reasoning_effort"] == "none"
+
+
+def test_gagawenai_gemini_adapts_messages_tools_and_usage() -> None:
+    captured = {}
+    usage = SimpleNamespace(
+        completion_tokens_details=SimpleNamespace(reasoning_tokens=17)
+    )
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(usage=usage)
+
+    provider = SimpleNamespace(
+        name="openai",
+        _client=SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    adapt_gagawenai_gemini(provider)
+    result = provider._client.chat.completions.create(
+        model="gemini-3.7-flash",
+        messages=[
+            {"role": "system", "content": "Use one tool."},
+            {"role": "user", "content": "Inspect card 1."},
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "inspect_cards",
+                            "arguments": '{"card_ids":[1]}',
+                        },
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": '{"cards":[{"id":1}]}',
+            },
+        ],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": "inspect_cards",
+                    "description": "Inspect cards.",
+                    "parameters": {"type": "object"},
+                },
+            }
+        ],
+        parallel_tool_calls=False,
+        reasoning_effort="none",
+        extra_body={"existing": True},
+    )
+
+    assert result.usage.reasoning_tokens == 17
+    assert provider.name == "gagawenai-gemini"
+    assert "tools" not in captured
+    assert "parallel_tool_calls" not in captured
+    assert "reasoning_effort" not in captured
+    assert captured["extra_body"]["existing"] is True
+    assert captured["extra_body"]["systemInstruction"] == {
+        "parts": [{"text": "Use one tool."}]
+    }
+    assert captured["extra_body"]["tools"][0]["functionDeclarations"][0][
+        "name"
+    ] == "inspect_cards"
+    contents = captured["extra_body"]["contents"]
+    assert contents[1]["parts"][0]["functionCall"] == {
+        "name": "inspect_cards",
+        "args": {"card_ids": [1]},
+    }
+    assert contents[2]["parts"][0]["functionResponse"]["name"] == "inspect_cards"
+
+
+def test_gagawenai_gemini_formal_thinking_disabled_run_fails_closed() -> None:
+    provider = SimpleNamespace(name="gagawenai-gemini")
+    try:
+        force_provider_thinking_disabled(provider, provider_name="gagawenai-gemini")
+    except ValueError as exc:
+        assert "non-zero" in str(exc)
+    else:
+        raise AssertionError("formal Gemini runs must fail closed")
 
 
 def test_reasoning_content_is_removed_recursively() -> None:

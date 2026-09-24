@@ -37,6 +37,14 @@ _PROFILE_DEFAULTS = {
         "base_env": "AZOPENAI_BASE_URL",
         "base_url": "https://azopenai.gagawenai.com/v1",
     },
+    "gagawenai-gemini": {
+        "model_env": "GAGAWENAI_GEMINI_MODEL",
+        "model": "gemini-3.7-flash",
+        "backend": "openai",
+        "key_env": "GAGAWENAI_GEMINI_API_KEY",
+        "base_env": "GAGAWENAI_GEMINI_BASE_URL",
+        "base_url": "https://api.gagawenai.com/v1",
+    },
     "bailian": {
         "model_env": "BAILIAN_MODEL",
         "model": "qwen3.7-flash",

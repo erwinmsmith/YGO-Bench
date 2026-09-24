@@ -11,6 +11,7 @@ from typing import Any
 
 from ygobench.agents.base import BaseAgent
 from ygobench.agents.provider_limits import (
+    adapt_gagawenai_gemini,
     force_provider_thinking_disabled,
     force_single_tool_call,
     omit_provider_token_limit,
@@ -347,6 +348,8 @@ class LLMFullDuelAgent(BaseAgent):
             # experiment's recorded thinking profile.
             kwargs["thinking_enabled"] = thinking_enabled
         self._provider = get_provider(backend, model.model, **kwargs)
+        if model.provider == "gagawenai-gemini":
+            adapt_gagawenai_gemini(self._provider)
         omit_provider_token_limit(self._provider)
         # DashScope's documented compatible-mode example does not expose this
         # optional OpenAI flag.  Prompt/schema validation enforce one action,

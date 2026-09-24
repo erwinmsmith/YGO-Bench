@@ -20,7 +20,16 @@ from ygobench.engine.upstream import UpstreamLayout
 def _add_model_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--provider",
-        choices=["anthropic", "openai", "vllm", "deepseek", "claude-cli", "bailian", "external"],
+        choices=[
+            "anthropic",
+            "openai",
+            "vllm",
+            "deepseek",
+            "claude-cli",
+            "bailian",
+            "external",
+            "gagawenai-gemini",
+        ],
         default=None,
     )
     parser.add_argument("--model", default=None)
