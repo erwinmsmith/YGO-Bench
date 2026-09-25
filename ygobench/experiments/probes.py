@@ -13,6 +13,7 @@ from typing import Any, Literal, TypeVar
 from ygobench.agents.llm_agent import compact_prompt_state
 from ygobench.agents.provider_limits import (
     adapt_gagawenai_gemini,
+    force_gagawenai_gemini_thinking_low,
     force_provider_thinking_disabled,
     omit_provider_token_limit,
 )
@@ -105,7 +106,10 @@ def _provider(provider_name: str | None = None, model: str | None = None):
     if config.provider == "gagawenai-gemini":
         adapt_gagawenai_gemini(provider)
     omit_provider_token_limit(provider)
-    force_provider_thinking_disabled(provider, provider_name=config.provider)
+    if config.provider == "gagawenai-gemini":
+        force_gagawenai_gemini_thinking_low(provider)
+    else:
+        force_provider_thinking_disabled(provider, provider_name=config.provider)
     return provider
 
 

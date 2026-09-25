@@ -11,6 +11,7 @@ from ygobench.agents.llm_agent import (
 from ygobench.agents.provider_limits import (
     adapt_gagawenai_gemini,
     force_deepseek_thinking_mode,
+    force_gagawenai_gemini_thinking_low,
     force_openai_thinking_disabled,
     force_provider_thinking_disabled,
     force_single_tool_call,
@@ -636,6 +637,36 @@ def test_gagawenai_gemini_adapts_messages_tools_and_usage() -> None:
         "google": {"thought_signature": "skip_thought_signature_validator"}
     }
     assert contents[2]["parts"][0]["functionResponse"]["name"] == "inspect_cards"
+
+
+def test_gagawenai_gemini_forces_low_thinking() -> None:
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(usage=None)
+
+    provider = SimpleNamespace(
+        name="openai",
+        _client=SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    adapt_gagawenai_gemini(provider)
+    force_gagawenai_gemini_thinking_low(provider)
+
+    provider._client.chat.completions.create(
+        model="gemini-3.7-flash",
+        messages=[{"role": "user", "content": "choose"}],
+        reasoning_effort="none",
+    )
+
+    assert captured["reasoning_effort"] == "low"
+    assert provider.thinking_enabled is True
+    assert provider.reasoning_effort == "low"
+    assert provider._ygobench_thinking_control == (
+        "gagawenai-gemini.reasoning_effort"
+    )
 
 
 def test_gagawenai_gemini_adapts_ygo_tool_schema() -> None:

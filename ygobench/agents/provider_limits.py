@@ -278,9 +278,12 @@ def adapt_gagawenai_gemini(provider: Any) -> Any:
         kwargs["extra_body"] = extra
         if isinstance(raw_tools, list):
             kwargs["tools"] = tools
-        # These OpenAI-only controls are rejected or ignored by the gateway.
+        # The gateway rejects none/off for Gemini 3.x. Preserve the supported
+        # low effort value, while dropping other OpenAI-only controls.
         kwargs.pop("parallel_tool_calls", None)
-        kwargs.pop("reasoning_effort", None)
+        requested_reasoning_effort = kwargs.pop("reasoning_effort", None)
+        if requested_reasoning_effort == "low":
+            kwargs["reasoning_effort"] = "low"
         response = create(*args, **kwargs)
         _restore_gemini_tool_names(response, tool_name_aliases)
         usage = getattr(response, "usage", None)
@@ -298,6 +301,34 @@ def adapt_gagawenai_gemini(provider: Any) -> Any:
     provider._ygobench_gagawenai_gemini = True
     provider._ygobench_thinking_control = "unsupported-by-gateway"
     provider.thinking_enabled = True
+    return provider
+
+
+def force_gagawenai_gemini_thinking_low(provider: Any) -> Any:
+    """Force Gemini 3.x Flash to use the gateway's lowest thinking level.
+
+    Gemini 3.7 Flash does not support a strict none/off setting.
+    Gagawenai exposes the OpenAI-compatible reasoning_effort field, so
+    keep the request at low even when the caller uses the formal duel
+    default of thinking_enabled=False for other providers.
+    """
+
+    provider.thinking_enabled = True
+    provider.reasoning_effort = "low"
+    provider._ygobench_thinking_control = "gagawenai-gemini.reasoning_effort"
+    if getattr(provider, "_ygobench_gemini_low_thinking", False):
+        return provider
+
+    completions = provider._client.chat.completions
+    create = completions.create
+
+    @wraps(create)
+    def create_with_low_gemini_thinking(*args: Any, **kwargs: Any) -> Any:
+        kwargs["reasoning_effort"] = "low"
+        return create(*args, **kwargs)
+
+    completions.create = create_with_low_gemini_thinking
+    provider._ygobench_gemini_low_thinking = True
     return provider
 
 

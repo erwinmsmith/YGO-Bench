@@ -12,6 +12,7 @@ from typing import Any
 from ygobench.agents.base import BaseAgent
 from ygobench.agents.provider_limits import (
     adapt_gagawenai_gemini,
+    force_gagawenai_gemini_thinking_low,
     force_provider_thinking_disabled,
     force_single_tool_call,
     omit_provider_token_limit,
@@ -359,7 +360,10 @@ class LLMFullDuelAgent(BaseAgent):
             force_single_tool_call(self._provider)
         if thinking_enabled:
             raise ValueError("Formal YGO-Bench runs require thinking_enabled=False")
-        force_provider_thinking_disabled(self._provider, provider_name=model.provider)
+        if model.provider == "gagawenai-gemini":
+            force_gagawenai_gemini_thinking_low(self._provider)
+        else:
+            force_provider_thinking_disabled(self._provider, provider_name=model.provider)
         self._tool_defs = {tool["name"]: tool for tool in tools_module.TOOLS}
         # Full-duel tool protocol v3 replaces repeated single-card lookups with
         # exactly one batch-inspection round per engine decision.
