@@ -674,6 +674,48 @@ def test_gagawenai_gemini_adapts_ygo_tool_schema() -> None:
     declaration = captured["extra_body"]["tools"][0]["functionDeclarations"][0]
     assert declaration["name"] == "select_chain"
     assert declaration["parameters"]["required"] == ["index"]
+def test_gagawenai_gemini_normalizes_tool_names() -> None:
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return SimpleNamespace(usage=None, choices=[])
+
+    provider = SimpleNamespace(
+        name="openai",
+        _client=SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    adapt_gagawenai_gemini(provider)
+    provider._client.chat.completions.create(
+        model="gemini-3.7-flash",
+        messages=[{"role": "user", "content": "choose"}],
+        tools=[
+            {
+                "type": "function",
+                "function": {
+                    "name": " select chain ",
+                    "parameters": {"type": "object"},
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "select_chain",
+                    "parameters": {"type": "object"},
+                },
+            },
+        ],
+    )
+
+    names = [
+        item["functionDeclarations"][0]["name"]
+        for item in captured["extra_body"]["tools"]
+    ]
+    assert names == ["select_chain"]
+
+
 def test_gagawenai_gemini_thinking_policy_does_not_block_diagnostic_runs() -> None:
     provider = SimpleNamespace(name="gagawenai-gemini")
     assert force_provider_thinking_disabled(

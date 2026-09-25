@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Mapping, Sequence
 from functools import wraps
 from typing import Any
@@ -20,6 +21,76 @@ def scrub_reasoning_content(value: Any) -> Any:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
         return [scrub_reasoning_content(item) for item in value]
     return value
+
+
+_GEMINI_TOOL_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_.:-]{0,127}$")
+
+
+def _normalize_gemini_tool_name(value: Any) -> str | None:
+    """Return a Gemini-compatible function name or ``None`` if unusable."""
+
+    if not isinstance(value, str):
+        return None
+    name = value.strip()
+    if not name:
+        return None
+    if _GEMINI_TOOL_NAME_RE.fullmatch(name):
+        return name
+    name = re.sub(r"[^A-Za-z0-9_.:-]", "_", name)
+    if not name or not re.match(r"^[A-Za-z_]", name):
+        name = f"tool_{name}"
+    name = name[:128]
+    return name if _GEMINI_TOOL_NAME_RE.fullmatch(name) else None
+
+
+def _normalize_openai_tool_names(
+    tools: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, str]]:
+    """Normalize OpenAI tool declarations and return safe-name aliases."""
+
+    normalized: list[dict[str, Any]] = []
+    aliases: dict[str, str] = {}
+    seen: set[str] = set()
+    for raw_tool in tools:
+        tool = dict(raw_tool)
+        raw_function = tool.get("function")
+        if isinstance(raw_function, Mapping):
+            function = dict(raw_function)
+        else:
+            function = {
+                "name": tool.get("name"),
+                "description": tool.get("description", ""),
+                "parameters": tool.get("input_schema"),
+            }
+        safe_name = _normalize_gemini_tool_name(function.get("name"))
+        if safe_name is None or safe_name in seen:
+            continue
+        original_name = function.get("name")
+        if original_name != safe_name:
+            aliases[safe_name] = str(original_name)
+        function["name"] = safe_name
+        tool["function"] = function
+        normalized.append(tool)
+        seen.add(safe_name)
+    return normalized, aliases
+
+
+def _restore_gemini_tool_names(response: Any, aliases: dict[str, str]) -> None:
+    """Restore names changed before sending an OpenAI-compatible request."""
+
+    if not aliases:
+        return
+    for choice in getattr(response, "choices", []) or []:
+        message = getattr(choice, "message", None)
+        for call in getattr(message, "tool_calls", []) or []:
+            function = getattr(call, "function", None)
+            safe_name = getattr(function, "name", None)
+            original_name = aliases.get(safe_name)
+            if function is not None and original_name is not None:
+                try:
+                    function.name = original_name
+                except Exception:  # noqa: BLE001
+                    object.__setattr__(function, "name", original_name)
 
 
 def _gagawenai_gemini_payload(
@@ -194,6 +265,7 @@ def adapt_gagawenai_gemini(provider: Any) -> Any:
             raise ValueError("Gagawenai Gemini requests require an OpenAI messages list")
         raw_tools = kwargs.pop("tools", None)
         tools = raw_tools if isinstance(raw_tools, list) else None
+        tools, tool_name_aliases = _normalize_openai_tool_names(tools or [])
         messages = _gemini_messages_with_thought_signatures(raw_messages)
         kwargs["messages"] = messages
         native = _gagawenai_gemini_payload(messages, tools)
@@ -205,6 +277,7 @@ def adapt_gagawenai_gemini(provider: Any) -> Any:
         kwargs.pop("parallel_tool_calls", None)
         kwargs.pop("reasoning_effort", None)
         response = create(*args, **kwargs)
+        _restore_gemini_tool_names(response, tool_name_aliases)
         usage = getattr(response, "usage", None)
         details = getattr(usage, "completion_tokens_details", None)
         reasoning_tokens = getattr(details, "reasoning_tokens", None)
