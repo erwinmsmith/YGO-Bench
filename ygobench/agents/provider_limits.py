@@ -69,6 +69,7 @@ def _normalize_openai_tool_names(
         if original_name != safe_name:
             aliases[safe_name] = str(original_name)
         function["name"] = safe_name
+        function["parameters"] = _normalize_gemini_schema(function.get("parameters"))
         tool["function"] = function
         normalized.append(tool)
         seen.add(safe_name)
@@ -483,3 +484,26 @@ def force_single_tool_call(provider: Any) -> Any:
     completions.create = create_with_single_tool_call
     provider._ygobench_single_tool_call = True
     return provider
+def _normalize_gemini_schema(value: Any) -> Any:
+    """Make JSON Schema compatible with the Gagawenai Gemini gateway."""
+    if isinstance(value, Mapping):
+        normalized: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "uniqueItems":
+                continue
+            if key == "enum" and isinstance(item, list):
+                # The gateway rejects numeric enum literals.
+                if any(not isinstance(enum_value, str) for enum_value in item):
+                    continue
+            if key == "type" and isinstance(item, list):
+                non_null = [schema_type for schema_type in item if schema_type != "null"]
+                if len(non_null) == 1:
+                    normalized["type"] = non_null[0]
+                    if "null" in item:
+                        normalized["nullable"] = True
+                    continue
+            normalized[key] = _normalize_gemini_schema(item)
+        return normalized
+    if isinstance(value, list):
+        return [_normalize_gemini_schema(item) for item in value]
+    return value
