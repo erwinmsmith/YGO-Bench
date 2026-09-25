@@ -616,16 +616,14 @@ def test_gagawenai_gemini_adapts_messages_tools_and_usage() -> None:
 
     assert result.usage.reasoning_tokens == 17
     assert provider.name == "gagawenai-gemini"
-    assert "tools" not in captured
+    assert "tools" in captured
     assert "parallel_tool_calls" not in captured
     assert "reasoning_effort" not in captured
     assert captured["extra_body"]["existing"] is True
     assert captured["extra_body"]["systemInstruction"] == {
         "parts": [{"text": "Use one tool."}]
     }
-    assert captured["extra_body"]["tools"][0]["functionDeclarations"][0][
-        "name"
-    ] == "inspect_cards"
+    assert captured["tools"][0]["function"]["name"] == "inspect_cards"
     contents = captured["extra_body"]["contents"]
     assert contents[1]["parts"][0]["functionCall"] == {
         "name": "inspect_cards",
@@ -671,9 +669,10 @@ def test_gagawenai_gemini_adapts_ygo_tool_schema() -> None:
         ],
     )
 
-    declaration = captured["extra_body"]["tools"][0]["functionDeclarations"][0]
+    declaration = captured["tools"][0]["function"]
     assert declaration["name"] == "select_chain"
     assert declaration["parameters"]["required"] == ["index"]
+    assert "tools" not in captured["extra_body"]
 def test_gagawenai_gemini_normalizes_tool_names() -> None:
     captured = {}
 
@@ -710,8 +709,8 @@ def test_gagawenai_gemini_normalizes_tool_names() -> None:
     )
 
     names = [
-        item["functionDeclarations"][0]["name"]
-        for item in captured["extra_body"]["tools"]
+        item["function"]["name"]
+        for item in captured["tools"]
     ]
     assert names == ["select_chain"]
 

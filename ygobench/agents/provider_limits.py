@@ -268,11 +268,15 @@ def adapt_gagawenai_gemini(provider: Any) -> Any:
         tools, tool_name_aliases = _normalize_openai_tool_names(tools or [])
         messages = _gemini_messages_with_thought_signatures(raw_messages)
         kwargs["messages"] = messages
-        native = _gagawenai_gemini_payload(messages, tools)
+        # Gagawenai accepts standard OpenAI tools, but rejects the native
+        # Gemini functionDeclarations envelope with a misleading name error.
+        native = _gagawenai_gemini_payload(messages, None)
         raw_extra = kwargs.get("extra_body")
         extra = dict(raw_extra) if isinstance(raw_extra, Mapping) else {}
         extra.update(native)
         kwargs["extra_body"] = extra
+        if isinstance(raw_tools, list):
+            kwargs["tools"] = tools
         # These OpenAI-only controls are rejected or ignored by the gateway.
         kwargs.pop("parallel_tool_calls", None)
         kwargs.pop("reasoning_effort", None)
