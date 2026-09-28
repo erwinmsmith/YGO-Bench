@@ -14,6 +14,7 @@ from ygobench.experiments.internal_validity import compute_exp7_metrics
 from ygobench.experiments.io import atomic_write_json
 from ygobench.experiments.metrics import compute_phase2_metrics, compute_probe_metrics
 from ygobench.experiments.probes import extract_probe_samples, run_probes
+from ygobench.experiments.recovery import inspect_run
 from ygobench.experiments.replanning import (
     aggregate_offline_exp6_metrics,
     run_offline_counterfactual_audit,
@@ -32,6 +33,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
     p0 = sub.add_parser("phase0")
     p0.add_argument("--run-id", default="phase0")
+    progress = sub.add_parser("status")
+    progress.add_argument("--run-id", required=True)
     duel = sub.add_parser("duel")
     duel.add_argument("--run-id", required=True)
     duel.add_argument("--deck1", default="BlueEyes")
@@ -39,7 +42,10 @@ def build_parser() -> argparse.ArgumentParser:
     duel.add_argument("--agent1", default="react-fast:deepseek:deepseek-v4-flash")
     duel.add_argument("--agent2", default="react-fast:deepseek:deepseek-v4-flash")
     duel.add_argument("--seed", type=int, default=1)
-    duel.add_argument("--max-decisions", type=int, default=12)
+    duel.add_argument(
+        "--max-decisions", type=int, default=0,
+        help="Maximum decisions; 0 runs a full duel without a decision cap.",
+    )
     metrics = sub.add_parser("phase2")
     metrics.add_argument("--run-id", required=True)
     metrics.add_argument(
@@ -135,7 +141,9 @@ def _run_phase4_all(run_dir: Path, *, sample_size: int, horizon: int) -> dict[st
 def main() -> int:
     args = build_parser().parse_args()
     root = _root()
-    if args.command == "phase0":
+    if args.command == "status":
+        result = inspect_run(root / args.run_id)
+    elif args.command == "phase0":
         output = root / args.run_id / "phase0_capabilities.json"
         result = inspect_capabilities(output)
     elif args.command == "duel":

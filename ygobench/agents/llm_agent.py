@@ -278,6 +278,7 @@ class ProviderCallError(RuntimeError):
         self.attempts = attempts
         self.cause_type = type(cause).__name__
         self.cause_message = str(cause)
+        self.status_code = getattr(cause, "status_code", None)
         super().__init__(f"{self.cause_type}: {self.cause_message}")
 
 
@@ -395,6 +396,9 @@ class LLMFullDuelAgent(BaseAgent):
         self.invalid_outputs = 0
         self.last_trace: dict[str, Any] = {}
         self._inspected_card_cache: dict[int, dict[str, Any]] = {}
+        self._recovery_store: Any = None
+        self._recovery_scope: str | None = None
+        self._recovery_call_index = 0
 
     def reset(self) -> None:
         self.usage = {}
@@ -402,6 +406,27 @@ class LLMFullDuelAgent(BaseAgent):
         self.invalid_outputs = 0
         self.last_trace = {}
         self._inspected_card_cache = {}
+        self._recovery_store = None
+        self._recovery_scope = None
+        self._recovery_call_index = 0
+
+    def set_recovery_scope(self, store: Any, scope_id: str) -> None:
+        """Start a durable API-turn sequence for one engine decision."""
+        self._recovery_store = store
+        self._recovery_scope = scope_id
+        self._recovery_call_index = 0
+
+    def restore_card_cache(self, committed_rows: list[dict[str, Any]]) -> None:
+        """Reconstruct only cards previously inspected by this seat."""
+        self._inspected_card_cache = {}
+        for row in committed_rows:
+            cache = (row.get("trace") or {}).get("card_cache") or {}
+            for value in cache.get("added", []):
+                code = int(value)
+                card = _find_card(row.get("observation") or {}, code)
+                knowledge = _static_card_knowledge(card)
+                if knowledge.get("name") is not None:
+                    self._inspected_card_cache[code] = knowledge
 
     def _accumulate(self, usage: dict[str, Any], elapsed: float) -> None:
         self.model_calls += 1
@@ -426,6 +451,8 @@ class LLMFullDuelAgent(BaseAgent):
         the same bounded retry policy and are preserved in the evidence trace.
         """
 
+        from ygobench.experiments.recovery import RecoveryConflict
+
         diagnostics = _tool_protocol_diagnostics(messages)
         if diagnostics["unresolved_tool_call_ids"] or diagnostics["protocol_errors"]:
             raise ProviderProtocolError(diagnostics)
@@ -434,27 +461,58 @@ class LLMFullDuelAgent(BaseAgent):
                 {"system": system, "messages": deepcopy(messages), "tools": deepcopy(tools)}
             )
         )
+        call_index = getattr(self, "_recovery_call_index", 0)
+        self._recovery_call_index = call_index + 1
+        recovery_request = {
+            **requests[-1],
+            "provider_configuration": getattr(self, "provider_config", {}),
+        }
         max_connection_attempts = getattr(
             self, "_max_provider_connection_attempts", MAX_PROVIDER_CONNECTION_ATTEMPTS
         )
         for attempt in range(max_connection_attempts):
             try:
-                turn = self._provider.respond(system=system, messages=messages, tools=tools)
+                if (
+                    getattr(self, "_recovery_store", None) is not None
+                    and getattr(self, "_recovery_scope", None) is not None
+                ):
+                    saved = self._recovery_store.call(
+                        scope_id=self._recovery_scope,
+                        call_index=call_index,
+                        request=recovery_request,
+                        invoke=lambda: self._provider.respond(
+                            system=system, messages=messages, tools=tools
+                        ),
+                    )
+                    turn = saved.turn
+                    reused = saved.reused
+                else:
+                    turn = self._provider.respond(system=system, messages=messages, tools=tools)
+                    reused = False
                 self._accumulate(turn.usage, turn.wallclock_seconds)
                 transport_attempts.append(
-                    {"attempt": attempt + 1, "outcome": "success", "error_type": None}
+                    {
+                        "attempt": attempt + 1,
+                        "outcome": "saved_response_reused" if reused else "success",
+                        "error_type": None,
+                    }
                 )
                 return turn
             except Exception as exc:  # noqa: BLE001
+                if isinstance(exc, RecoveryConflict):
+                    raise
+                status_code = getattr(exc, "status_code", None)
+                retryable = status_code not in {400, 401, 402, 403}
                 transport_attempts.append(
                     {
                         "attempt": attempt + 1,
                         "outcome": "error",
                         "error_type": type(exc).__name__,
-                        "retryable": True,
+                        "status_code": status_code,
+                        "retryable": retryable,
                     }
                 )
-                if attempt + 1 >= max_connection_attempts:
+                if not retryable or attempt + 1 >= max_connection_attempts:
                     raise ProviderCallError(exc, transport_attempts) from exc
                 time.sleep(CONNECTION_RETRY_DELAYS_SECONDS[attempt])
 

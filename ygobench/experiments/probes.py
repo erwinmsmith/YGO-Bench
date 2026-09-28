@@ -7,6 +7,7 @@ import random
 import re
 import sys
 from collections import Counter
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -19,12 +20,19 @@ from ygobench.agents.provider_limits import (
 )
 from ygobench.config import default_model_config
 from ygobench.engine.upstream import UpstreamLayout
+from ygobench.experiments.config import stable_id
 from ygobench.experiments.identity import (
     model_configuration_id,
     policy_descriptor,
     policy_id,
 )
-from ygobench.experiments.io import JsonlJournal, atomic_write_json, content_hash
+from ygobench.experiments.io import JsonlJournal, atomic_write_json, content_hash, read_json
+from ygobench.experiments.recovery import (
+    RecoveryConflict,
+    RecoveryStore,
+    pause_status,
+)
+from ygobench.experiments.registry import LeaseHeartbeat, TaskRegistry
 
 _COMMITMENT_COMMANDS = {"activate", "summon", "sp_summon", "attack"}
 _NEW_DECISION_BOUNDARIES = {"select_idlecmd", "select_battlecmd", "rock_paper_scissors"}
@@ -42,14 +50,15 @@ def _probe_policy_descriptor(
     provider_name: str | None = None, model: str | None = None
 ) -> dict[str, Any]:
     config = default_model_config(provider=provider_name, model=model)
+    gemini_low = config.provider == "gagawenai-gemini"
     descriptor = policy_descriptor(
         f"react-fast:{config.provider}:{config.model}",
         runtime={
             "provider": config.provider,
             "model": config.model,
             "backend": config.backend,
-            "thinking_enabled": False,
-            "reasoning_effort": None,
+            "thinking_enabled": gemini_low,
+            "reasoning_effort": "low" if gemini_low else None,
             "temperature": 0.0,
             "max_tokens": None,
         },
@@ -57,9 +66,13 @@ def _probe_policy_descriptor(
     descriptor.update(
         {
             "task_profile": "post_hoc_public_state_and_forecast_v2",
-            "thinking_enabled": False,
-            "reasoning_mode": "disabled",
-            "thinking_control": "explicit-provider-wire-disable-v1",
+            "thinking_enabled": gemini_low,
+            "reasoning_mode": "low" if gemini_low else "disabled",
+            "thinking_control": (
+                "gagawenai-gemini.reasoning_effort"
+                if gemini_low
+                else "explicit-provider-wire-disable-v1"
+            ),
             "prompt_version": "exp3-exp5-public-prefix-v2",
             "tool_schema_version": "post-hoc-probe-tools-v2",
             "context_policy": "public-prefix-no-hidden-state-v2",
@@ -605,12 +618,21 @@ def extract_probe_samples(
 ) -> dict[str, int]:
     state_out = JsonlJournal(run_dir / "derived" / "state_probe_samples.jsonl")
     forecast_out = JsonlJournal(run_dir / "derived" / "forecast_samples.jsonl")
-    state_out.rewrite([])
-    forecast_out.rewrite([])
+    state_records: list[dict[str, Any]] = []
+    forecast_records: list[dict[str, Any]] = []
     state_count = forecast_count = 0
     for game_dir in sorted((run_dir / "games").glob("*")):
         if not (game_dir / "manifest.json").is_file():
             continue
+        outcome = read_json(game_dir / "outcome.json")
+        status = read_json(game_dir / "status.json") or {}
+        if (
+            not outcome
+            or status.get("status") != "COMPLETED"
+            or not outcome.get("game_over")
+            or not outcome.get("competitive_eligible")
+        ):
+            raise RecoveryConflict(f"duel {game_dir.name} is not a complete rated game")
         public = JsonlJournal(game_dir / "trajectory.jsonl").recover()
         oracle = JsonlJournal(game_dir / "oracle_trajectory.jsonl").recover()
         if not public:
@@ -635,7 +657,7 @@ def extract_probe_samples(
                     "acting_player": public[index]["player"],
                 },
             }
-            state_out.append(
+            state_records.append(
                 {
                     "sample_id": f"{public[index]['game_id']}:{public[index]['decision_id']}:state",
                     "game_id": public[index]["game_id"],
@@ -744,9 +766,155 @@ def extract_probe_samples(
                     not candidate["availability_ground_truth"] for candidate in forecast_candidates
                 ),
             }
-            forecast_out.append(sample)
+            forecast_records.append(sample)
             forecast_count += 1
+    state_out.rewrite(state_records)
+    forecast_out.rewrite(forecast_records)
     return {"state_samples": state_count, "forecast_samples": forecast_count}
+
+
+def _execute_probe_task(
+    *,
+    registry: TaskRegistry,
+    recovery_store: RecoveryStore,
+    evaluator_id: str,
+    experiment: str,
+    sample: dict[str, Any],
+    sample_hash: str,
+    request: dict[str, Any],
+    invoke: Callable[[], Any],
+    make_record: Callable[[Any], dict[str, Any]],
+    journal: JsonlJournal,
+) -> None:
+    task_id = stable_id(
+        "probe", [evaluator_id, experiment, sample["sample_id"]], length=24
+    )
+    registry.add(
+        task_id,
+        "probe",
+        {
+            "evaluator_id": evaluator_id,
+            "experiment": experiment,
+            "sample_id": sample["sample_id"],
+            "sample_hash": sample_hash,
+        },
+    )
+    if not registry.claim(task_id):
+        raise RuntimeError(f"probe task {task_id} is already running or completed")
+    generation = int(registry.row(task_id)["lease_generation"])
+    heartbeat = LeaseHeartbeat(registry, task_id, generation)
+    heartbeat.start()
+    api_request_pending = True
+    try:
+        turn = recovery_store.call(
+            scope_id=f"probe:{evaluator_id}:{experiment}:{sample['sample_id']}",
+            call_index=0,
+            request=request,
+            invoke=invoke,
+        ).turn
+        api_request_pending = False
+        record = make_record(turn)
+        heartbeat.assert_owned()
+        journal.append(record)
+        if not registry.finish(task_id, generation=generation):
+            raise RuntimeError(f"probe task {task_id} lost its lease")
+    except Exception as exc:
+        registry.finish(
+            task_id,
+            error=f"{type(exc).__name__}: {exc}",
+            status=(
+                pause_status(exc)
+                if api_request_pending
+                else "FAILED_RETRYABLE"
+            ),
+            generation=generation,
+        )
+        raise
+    finally:
+        heartbeat.stop()
+
+
+def _state_result_record(
+    sample: dict[str, Any], sample_hash: str, evaluator_identity: dict[str, Any], turn: Any
+) -> dict[str, Any]:
+    call = next((call for call in turn.tool_calls if call.name == "report_state"), None)
+    prediction = call.arguments if call else None
+    schema_errors = []
+    if not isinstance(prediction, dict):
+        schema_errors.append("missing_or_non_object_prediction")
+    else:
+        for key, expected in sample["ground_truth"].items():
+            if key not in prediction:
+                schema_errors.append(f"missing_field:{key}")
+            elif isinstance(expected, list) and not isinstance(prediction[key], list):
+                schema_errors.append(f"wrong_type:{key}:array")
+            elif isinstance(expected, int) and (
+                not isinstance(prediction[key], int) or isinstance(prediction[key], bool)
+            ):
+                schema_errors.append(f"wrong_type:{key}:integer")
+            elif isinstance(expected, str) and not isinstance(prediction[key], str):
+                schema_errors.append(f"wrong_type:{key}:string")
+    return {
+        "sample_id": sample["sample_id"],
+        "game_id": sample["game_id"],
+        "sample_hash": sample_hash,
+        "evaluator_identity": evaluator_identity,
+        "ground_truth": sample["ground_truth"],
+        "prediction": prediction,
+        "schema_valid": not schema_errors,
+        "schema_errors": schema_errors,
+        "trajectory_progress": sample["trajectory_progress"],
+        "checkpoint_tags": sample["checkpoint_tags"],
+        "state_complexity": sample["state_complexity"],
+        "state_complexity_score": sample["state_complexity_score"],
+        "state_complexity_band": sample["state_complexity_band"],
+        "state_sampling_stratum": sample["state_sampling_stratum"],
+        "inclusion_probability": sample.get("inclusion_probability"),
+        "candidate_state_stratum_counts": sample.get("candidate_state_stratum_counts"),
+        "usage": turn.usage,
+        "elapsed_seconds": turn.wallclock_seconds,
+    }
+
+
+def _forecast_result_record(
+    sample: dict[str, Any], sample_hash: str, evaluator_identity: dict[str, Any], turn: Any
+) -> dict[str, Any]:
+    call = next((call for call in turn.tool_calls if call.name == "report_forecast"), None)
+    availability_probability = (
+        call.arguments.get("p_opponent_has_legal_response") if call else None
+    )
+    behavior_probability = call.arguments.get("p_opponent_will_respond") if call else None
+    schema_errors = []
+    for key, value in (
+        ("p_opponent_has_legal_response", availability_probability),
+        ("p_opponent_will_respond", behavior_probability),
+    ):
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            schema_errors.append(f"missing_or_non_numeric:{key}")
+        elif not 0 <= float(value) <= 1:
+            schema_errors.append(f"out_of_range:{key}")
+    return {
+        "sample_id": sample["sample_id"],
+        "game_id": sample["game_id"],
+        "sample_hash": sample_hash,
+        "evaluator_identity": evaluator_identity,
+        "response_window_id": sample["response_window_id"],
+        "availability_ground_truth": sample["availability_ground_truth"],
+        "behavior_ground_truth": sample["behavior_ground_truth"],
+        "availability_probability": availability_probability,
+        "behavior_probability": behavior_probability,
+        "schema_valid": not schema_errors,
+        "schema_errors": schema_errors,
+        "joint_stratum": sample["joint_stratum"],
+        "inclusion_probability": sample.get("inclusion_probability"),
+        "candidate_joint_stratum_counts": sample.get("candidate_joint_stratum_counts"),
+        "global_candidate_joint_stratum_counts": sample.get(
+            "global_candidate_joint_stratum_counts"
+        ),
+        "strata": sample["strata"],
+        "usage": turn.usage,
+        "elapsed_seconds": turn.wallclock_seconds,
+    }
 
 
 def run_probes(
@@ -765,6 +933,8 @@ def run_probes(
     evaluator_identity = probe_evaluator_identity(provider_name, model)
     evaluator_id = evaluator_identity["evaluator_id"]
     provider = _provider(provider_name, model)
+    recovery_store = RecoveryStore(run_dir / "recovery.sqlite")
+    registry = TaskRegistry(run_dir / "task_state.sqlite")
     state_samples = (
         _select_state_samples(
             JsonlJournal(run_dir / "derived" / "state_probe_samples.jsonl").recover(),
@@ -785,6 +955,8 @@ def run_probes(
     output_dir = run_dir / "derived" / "probe_results" / evaluator_id
     sample_manifest = {
         "sampling_version": PROBE_SAMPLING_VERSION,
+        "evaluator_identity": evaluator_identity,
+        "forecast_sampling": forecast_sampling,
         "budget": {
             "state_samples_requested": max_state_samples,
             "forecast_samples_requested": max_forecast_samples,
@@ -807,20 +979,31 @@ def run_probes(
             sorted(Counter(sample["joint_stratum"] for sample in forecast_samples).items())
         ),
         "state_pool_hash": content_hash(
-            [
-                sample["sample_id"]
-                for sample in JsonlJournal(
-                    run_dir / "derived" / "state_probe_samples.jsonl"
-                ).recover()
-            ]
+            JsonlJournal(run_dir / "derived" / "state_probe_samples.jsonl").recover()
         ),
         "forecast_pool_hash": content_hash(
-            [
-                sample["sample_id"]
-                for sample in JsonlJournal(run_dir / "derived" / "forecast_samples.jsonl").recover()
-            ]
+            JsonlJournal(run_dir / "derived" / "forecast_samples.jsonl").recover()
         ),
     }
+    manifest_path = output_dir / "sample_manifest.json"
+    frozen = read_json(manifest_path)
+    if frozen:
+        for key in (
+            "sampling_version",
+            "evaluator_identity",
+            "forecast_sampling",
+            "state_pool_hash",
+            "forecast_pool_hash",
+        ):
+            if frozen.get(key) != sample_manifest[key]:
+                raise RecoveryConflict(f"probe {key} changed during resume")
+        for kind in ("state", "forecast"):
+            old_ids = frozen.get(f"{kind}_sample_ids", [])
+            new_ids = sample_manifest[f"{kind}_sample_ids"]
+            if not new_ids:
+                sample_manifest[f"{kind}_sample_ids"] = old_ids
+            elif new_ids[: len(old_ids)] != old_ids:
+                raise RecoveryConflict(f"probe {kind} selection is not a prefix extension")
     atomic_write_json(output_dir / "sample_manifest.json", sample_manifest)
     state_out = JsonlJournal(output_dir / "state_probe_results.jsonl")
     forecast_out = JsonlJournal(output_dir / "forecast_results.jsonl")
@@ -897,55 +1080,30 @@ def run_probes(
     for sample in state_samples:
         if sample["sample_id"] in completed_state:
             continue
-        turn = provider.respond(
-            system=(
-                "Reconstruct only objectively knowable state from the supplied full-duel prefix."
-            ),
-            messages=[
-                {"role": "user", "content": json.dumps(sample["prefix"], ensure_ascii=False)}
-            ],
-            tools=[state_tool],
-        )
-        call = next((call for call in turn.tool_calls if call.name == "report_state"), None)
-        prediction = call.arguments if call else None
-        schema_errors = []
-        if not isinstance(prediction, dict):
-            schema_errors.append("missing_or_non_object_prediction")
-        else:
-            for key, expected in sample["ground_truth"].items():
-                if key not in prediction:
-                    schema_errors.append(f"missing_field:{key}")
-                elif isinstance(expected, list) and not isinstance(prediction[key], list):
-                    schema_errors.append(f"wrong_type:{key}:array")
-                elif isinstance(expected, int) and (
-                    not isinstance(prediction[key], int) or isinstance(prediction[key], bool)
-                ):
-                    schema_errors.append(f"wrong_type:{key}:integer")
-                elif isinstance(expected, str) and not isinstance(prediction[key], str):
-                    schema_errors.append(f"wrong_type:{key}:string")
-        state_out.append(
-            {
-                "sample_id": sample["sample_id"],
-                "game_id": sample["game_id"],
-                "sample_hash": state_hashes[sample["sample_id"]],
+        system = "Reconstruct only objectively knowable state from the supplied full-duel prefix."
+        messages = [
+            {"role": "user", "content": json.dumps(sample["prefix"], ensure_ascii=False)}
+        ]
+        _execute_probe_task(
+            registry=registry,
+            recovery_store=recovery_store,
+            evaluator_id=evaluator_id,
+            experiment="exp3",
+            sample=sample,
+            sample_hash=state_hashes[sample["sample_id"]],
+            request={
+                "system": system,
+                "messages": messages,
+                "tools": [state_tool],
                 "evaluator_identity": evaluator_identity,
-                "ground_truth": sample["ground_truth"],
-                "prediction": prediction,
-                "schema_valid": not schema_errors,
-                "schema_errors": schema_errors,
-                "trajectory_progress": sample["trajectory_progress"],
-                "checkpoint_tags": sample["checkpoint_tags"],
-                "state_complexity": sample["state_complexity"],
-                "state_complexity_score": sample["state_complexity_score"],
-                "state_complexity_band": sample["state_complexity_band"],
-                "state_sampling_stratum": sample["state_sampling_stratum"],
-                "inclusion_probability": sample.get("inclusion_probability"),
-                "candidate_state_stratum_counts": sample.get(
-                    "candidate_state_stratum_counts"
-                ),
-                "usage": turn.usage,
-                "elapsed_seconds": turn.wallclock_seconds,
-            }
+            },
+            invoke=lambda system=system, messages=messages: provider.respond(
+                system=system, messages=messages, tools=[state_tool]
+            ),
+            make_record=lambda turn, sample=sample: _state_result_record(
+                sample, state_hashes[sample["sample_id"]], evaluator_identity, turn
+            ),
+            journal=state_out,
         )
     forecast_tool = {
         "name": "report_forecast",
@@ -976,64 +1134,44 @@ def run_probes(
     for sample in forecast_samples:
         if sample["sample_id"] in completed_forecast:
             continue
-        turn = provider.respond(
-            system=(
-                "Using only the acting player's visible information, estimate two "
-                "separate probabilities: whether the opponent objectively has a legal "
-                "response, and, conditional on such a response being available, whether "
-                "the opponent will choose to use it."
-            ),
-            messages=[
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "observation": sample["observation"],
-                            "action": sample["commitment_action"],
-                        },
-                        ensure_ascii=False,
-                    ),
-                }
-            ],
-            tools=[forecast_tool],
+        system = (
+            "Using only the acting player's visible information, estimate two "
+            "separate probabilities: whether the opponent objectively has a legal "
+            "response, and, conditional on such a response being available, whether "
+            "the opponent will choose to use it."
         )
-        call = next((call for call in turn.tool_calls if call.name == "report_forecast"), None)
-        availability_probability = (
-            call.arguments.get("p_opponent_has_legal_response") if call else None
-        )
-        behavior_probability = call.arguments.get("p_opponent_will_respond") if call else None
-        schema_errors = []
-        for key, value in (
-            ("p_opponent_has_legal_response", availability_probability),
-            ("p_opponent_will_respond", behavior_probability),
-        ):
-            if not isinstance(value, (int, float)) or isinstance(value, bool):
-                schema_errors.append(f"missing_or_non_numeric:{key}")
-            elif not 0 <= float(value) <= 1:
-                schema_errors.append(f"out_of_range:{key}")
-        forecast_out.append(
+        messages = [
             {
-                "sample_id": sample["sample_id"],
-                "game_id": sample["game_id"],
-                "sample_hash": forecast_hashes[sample["sample_id"]],
-                "evaluator_identity": evaluator_identity,
-                "response_window_id": sample["response_window_id"],
-                "availability_ground_truth": sample["availability_ground_truth"],
-                "behavior_ground_truth": sample["behavior_ground_truth"],
-                "availability_probability": availability_probability,
-                "behavior_probability": behavior_probability,
-                "schema_valid": not schema_errors,
-                "schema_errors": schema_errors,
-                "joint_stratum": sample["joint_stratum"],
-                "inclusion_probability": sample.get("inclusion_probability"),
-                "candidate_joint_stratum_counts": sample.get("candidate_joint_stratum_counts"),
-                "global_candidate_joint_stratum_counts": sample.get(
-                    "global_candidate_joint_stratum_counts"
+                "role": "user",
+                "content": json.dumps(
+                    {
+                        "observation": sample["observation"],
+                        "action": sample["commitment_action"],
+                    },
+                    ensure_ascii=False,
                 ),
-                "strata": sample["strata"],
-                "usage": turn.usage,
-                "elapsed_seconds": turn.wallclock_seconds,
             }
+        ]
+        _execute_probe_task(
+            registry=registry,
+            recovery_store=recovery_store,
+            evaluator_id=evaluator_id,
+            experiment="exp5",
+            sample=sample,
+            sample_hash=forecast_hashes[sample["sample_id"]],
+            request={
+                "system": system,
+                "messages": messages,
+                "tools": [forecast_tool],
+                "evaluator_identity": evaluator_identity,
+            },
+            invoke=lambda system=system, messages=messages: provider.respond(
+                system=system, messages=messages, tools=[forecast_tool]
+            ),
+            make_record=lambda turn, sample=sample: _forecast_result_record(
+                sample, forecast_hashes[sample["sample_id"]], evaluator_identity, turn
+            ),
+            journal=forecast_out,
         )
     return {
         "evaluator_id": evaluator_id,

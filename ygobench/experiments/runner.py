@@ -30,7 +30,8 @@ from ygobench.experiments.io import (
 )
 from ygobench.experiments.legal import exact_legal_action_match
 from ygobench.experiments.oracle import build_oracle_state
-from ygobench.experiments.registry import TaskRegistry
+from ygobench.experiments.recovery import RecoveryConflict, RecoveryStore, pause_status
+from ygobench.experiments.registry import LeaseHeartbeat, TaskRegistry
 from ygobench.experiments.session import DuelSession
 
 MAX_MODEL_ACTION_ATTEMPTS = 3
@@ -192,21 +193,6 @@ def _trace_diagnostics(trace: dict[str, Any], expected: str) -> dict[str, Any]:
     }
 
 
-def _reconcile(public: JsonlJournal, oracle: JsonlJournal) -> tuple[list[dict], list[dict]]:
-    public_rows = public.recover()
-    oracle_rows = oracle.recover()
-    common = min(len(public_rows), len(oracle_rows))
-    while common and public_rows[common - 1].get("decision_id") != oracle_rows[common - 1].get(
-        "decision_id"
-    ):
-        common -= 1
-    if len(public_rows) != common:
-        public.rewrite(public_rows[:common])
-    if len(oracle_rows) != common:
-        oracle.rewrite(oracle_rows[:common])
-    return public_rows[:common], oracle_rows[:common]
-
-
 def _decision_error_code(
     *,
     expected_responder: str,
@@ -320,35 +306,82 @@ def run_evidence_duel(
     public = JsonlJournal(game_dir / "trajectory.jsonl")
     oracle = JsonlJournal(game_dir / "oracle_trajectory.jsonl")
     technical_failures = JsonlJournal(game_dir / "technical_failures.jsonl")
-    public_rows, oracle_rows = _reconcile(public, oracle)
-    outcome_path = game_dir / "outcome.json"
-    existing_outcome = read_json(outcome_path)
-    if existing_outcome and existing_outcome.get("game_over"):
-        _export_web_replay(run_dir, game_dir)
-        return existing_outcome
-
-    agents = (
-        create_agent(config.agent1, seed=config.seed * 2),
-        create_agent(config.agent2, seed=config.seed * 2 + 1),
-    )
-    for agent in agents:
-        agent.reset()
-
+    recovery_store = RecoveryStore(run_dir / "recovery.sqlite")
+    first_index = len(replay_prefix) + 1 if replay_prefix is not None else 1
     registry = TaskRegistry(run_dir / "task_state.sqlite")
     registry.add(config.game_id, "full_duel", config.to_dict())
     task = registry.row(config.game_id)
-    if task and task["status"] == "COMPLETED" and existing_outcome:
-        return existing_outcome
-    if not registry.claim(config.game_id):
-        raise RuntimeError(f"task {config.game_id} is already running or completed")
-
-    manifest_path = game_dir / "manifest.json"
-    if not manifest_path.exists():
-        atomic_write_json(manifest_path, _manifest(config, game_dir, agents))
-    atomic_write_json(
-        game_dir / "status.json",
-        {"status": "RUNNING", "committed_decisions": len(public_rows)},
+    already_completed = bool(task and task["status"] == "COMPLETED")
+    if not already_completed and not registry.claim(config.game_id):
+        raise RuntimeError(f"task {config.game_id} is already running")
+    generation = (
+        int(registry.row(config.game_id)["lease_generation"])
+        if not already_completed else None
     )
+    try:
+        public_rows, oracle_rows = recovery_store.reconcile_journals(
+            config.game_id, public, oracle, first_index=first_index
+        )
+        outcome_path = game_dir / "outcome.json"
+        existing_outcome = read_json(outcome_path)
+        agents = (
+            create_agent(config.agent1, seed=config.seed * 2),
+            create_agent(config.agent2, seed=config.seed * 2 + 1),
+        )
+        for agent in agents:
+            agent.reset()
+        for seat, agent in enumerate(agents):
+            if hasattr(agent, "restore_card_cache"):
+                agent.restore_card_cache(
+                    [row for row in public_rows if int(row.get("player", -1)) == seat]
+                )
+        manifest_path = game_dir / "manifest.json"
+        expected_manifest = _manifest(config, game_dir, agents)
+        if replay_prefix is not None:
+            expected_manifest["external_prefix_hash"] = content_hash(replay_prefix)
+        if manifest_path.exists():
+            frozen_manifest = read_json(manifest_path)
+            if frozen_manifest.get("config_hash") != config.hash():
+                raise RecoveryConflict("duel configuration changed on resume")
+            for key in ("policy_identities", "provenance"):
+                if frozen_manifest.get(key) != expected_manifest.get(key):
+                    raise RecoveryConflict(f"duel {key} changed on resume")
+            if frozen_manifest.get("external_prefix_hash") != expected_manifest.get(
+                "external_prefix_hash"
+            ):
+                raise RecoveryConflict("duel external replay prefix changed on resume")
+        else:
+            atomic_write_json(manifest_path, expected_manifest)
+
+        if existing_outcome and existing_outcome.get("game_over"):
+            expected_count = len(public_rows) + len(replay_prefix or [])
+            if int(existing_outcome.get("decisions", -1)) != expected_count:
+                raise RecoveryConflict("completed duel outcome and committed prefix disagree")
+            if generation is not None:
+                atomic_write_json(
+                    game_dir / "status.json",
+                    {"status": "COMPLETED", "committed_decisions": expected_count},
+                )
+                registry.finish(config.game_id, generation=generation)
+            _export_web_replay(run_dir, game_dir)
+            return existing_outcome
+        if already_completed:
+            if existing_outcome:
+                return existing_outcome
+            raise RecoveryConflict("completed duel task is missing its outcome")
+    except Exception as exc:
+        if generation is not None:
+            registry.finish(
+                config.game_id,
+                error=f"{type(exc).__name__}: {exc}",
+                status=(
+                    "PAUSED_CONFIG" if isinstance(exc, RecoveryConflict) else "FAILED_RETRYABLE"
+                ),
+                generation=generation,
+            )
+        raise
+    assert generation is not None
+    heartbeat = LeaseHeartbeat(registry, config.game_id, generation)
 
     deck_root = PROJECT_ROOT / "resources" / "decks"
     session: DuelSession | None = None
@@ -358,14 +391,20 @@ def run_evidence_duel(
     technical_failure_type: str | None = None
     technical_failure_error: str | None = None
     technical_failure_player: int | None = None
+    technical_pause_status: str | None = None
     started = time.perf_counter()
     interventions = interventions or {}
     replay_rows = [*replay_prefix, *public_rows] if replay_prefix is not None else public_rows
     external_prefix_totals = (
-        _record_totals(replay_rows) if replay_prefix is not None else _record_totals([])
+        _record_totals(replay_prefix) if replay_prefix is not None else _record_totals([])
     )
     previous_commit = public_rows[-1].get("commit_hash", "") if public_rows else ""
     try:
+        heartbeat.start()
+        atomic_write_json(
+            game_dir / "status.json",
+            {"status": "RUNNING", "committed_decisions": len(public_rows)},
+        )
         session = DuelSession(
             deck_root / f"{config.deck1}.ydk",
             deck_root / f"{config.deck2}.ydk",
@@ -416,6 +455,11 @@ def run_evidence_duel(
                 legal_actions_complete=bool(view["legal"]["enumeration_complete"]),
             )
             agent = agents[player]
+            if hasattr(agent, "set_recovery_scope"):
+                agent.set_recovery_scope(
+                    recovery_store,
+                    f"duel:{config.game_id}:d{decision_index + 1:06d}:p{player}",
+                )
             attempted: ActionChoice | None = None
             executed: ActionChoice | None = None
             agent_error: str | None = None
@@ -463,8 +507,11 @@ def run_evidence_duel(
                     technical_failure_type = "api_failure"
                     technical_failure_error = agent_error
                     technical_failure_player = player
+                    technical_pause_status = pause_status(exc)
                     termination = "api_failure_abort"
             except Exception as exc:  # noqa: BLE001
+                if isinstance(exc, RecoveryConflict):
+                    raise
                 agent_error = f"{type(exc).__name__}: {exc}"
                 model_error = None
                 decision_technical_failure = True
@@ -558,6 +605,7 @@ def run_evidence_duel(
                             technical_failure_type = "api_failure"
                             technical_failure_error = api_error
                             technical_failure_player = player
+                            technical_pause_status = pause_status(exc)
                             termination = "api_failure_abort"
                             attempt_trace = {
                                 "exception": api_error,
@@ -572,6 +620,8 @@ def run_evidence_duel(
                                 ),
                             }
                         except Exception as exc:  # noqa: BLE001
+                            if isinstance(exc, RecoveryConflict):
+                                raise
                             technical_failure_error = f"{type(exc).__name__}: {exc}"
                             decision_technical_failure = True
                             technical_failure_type = "agent_runtime_failure"
@@ -737,6 +787,10 @@ def run_evidence_duel(
                 # nonexistent action.
                 technical_failures.append(record)
             else:
+                heartbeat.assert_owned()
+                recovery_store.commit_decision(
+                    config.game_id, record, oracle_record, first_index=first_index
+                )
                 oracle.append(oracle_record)
                 public.append(record)
                 previous_commit = record["commit_hash"]
@@ -764,7 +818,7 @@ def run_evidence_duel(
                 game_dir / "status.json",
                 {"status": "RUNNING", "committed_decisions": decision_index},
             )
-            registry.renew(config.game_id)
+            heartbeat.assert_owned()
             if terminal_model_failure or decision_technical_failure:
                 break
 
@@ -862,13 +916,16 @@ def run_evidence_duel(
             },
             "elapsed_seconds": round(time.perf_counter() - started, 3),
         }
+        heartbeat.assert_owned()
         atomic_write_json(outcome_path, outcome)
         _export_web_replay(run_dir, game_dir)
         atomic_write_json(
             game_dir / "status.json",
             {
                 "status": (
-                    "COMPLETED" if technical_failure_type is None else "FAILED_RETRYABLE"
+                    "COMPLETED"
+                    if technical_failure_type is None
+                    else technical_pause_status or "FAILED_RETRYABLE"
                 ),
                 "committed_decisions": decision_index,
                 "technical_failure_type": technical_failure_type,
@@ -876,24 +933,36 @@ def run_evidence_duel(
             },
         )
         if technical_failure_type is None:
-            registry.finish(config.game_id)
+            registry.finish(config.game_id, generation=generation)
         else:
             registry.finish(
                 config.game_id,
                 error=f"{technical_failure_type}: {technical_failure_error}",
+                status=technical_pause_status or "FAILED_RETRYABLE",
+                generation=generation,
             )
         return outcome
     except Exception as exc:
-        registry.finish(config.game_id, error=f"{type(exc).__name__}: {exc}")
-        atomic_write_json(
-            game_dir / "status.json",
-            {
-                "status": "FAILED_RETRYABLE",
-                "committed_decisions": len(public.recover()),
-                "error": f"{type(exc).__name__}: {exc}",
-            },
+        failure_status = (
+            "PAUSED_CONFIG" if isinstance(exc, RecoveryConflict) else "FAILED_RETRYABLE"
         )
+        owned = registry.finish(
+            config.game_id,
+            error=f"{type(exc).__name__}: {exc}",
+            status=failure_status,
+            generation=generation,
+        )
+        if owned:
+            atomic_write_json(
+                game_dir / "status.json",
+                {
+                    "status": failure_status,
+                    "committed_decisions": len(public.recover()),
+                    "error": f"{type(exc).__name__}: {exc}",
+                },
+            )
         raise
     finally:
+        heartbeat.stop()
         if session is not None:
             session.close()
