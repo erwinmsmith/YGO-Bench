@@ -269,15 +269,13 @@ def adapt_gagawenai_gemini(provider: Any) -> Any:
         tools, tool_name_aliases = _normalize_openai_tool_names(tools or [])
         messages = _gemini_messages_with_thought_signatures(raw_messages)
         kwargs["messages"] = messages
-        # Gagawenai accepts standard OpenAI tools, but rejects the native
-        # Gemini functionDeclarations envelope with a misleading name error.
-        native = _gagawenai_gemini_payload(messages, None)
+        native = _gagawenai_gemini_payload(messages, tools)
         raw_extra = kwargs.get("extra_body")
         extra = dict(raw_extra) if isinstance(raw_extra, Mapping) else {}
         extra.update(native)
         kwargs["extra_body"] = extra
-        if isinstance(raw_tools, list):
-            kwargs["tools"] = tools
+        # The gateway rejects the OpenAI ``tools`` envelope. The equivalent
+        # Gemini ``functionDeclarations`` are already present in extra_body.
         # The gateway rejects none/off for Gemini 3.x. Preserve the supported
         # low effort value, while dropping other OpenAI-only controls.
         kwargs.pop("parallel_tool_calls", None)
@@ -441,6 +439,38 @@ def force_qwen_thinking_mode(provider: Any, *, enabled: bool) -> Any:
     return provider
 
 
+def force_minimax_m3_thinking_mode(provider: Any, *, enabled: bool) -> Any:
+    """Send MiniMax M3's provider-specific thinking object on every request."""
+
+    provider._ygobench_minimax_m3_thinking_mode = (
+        "adaptive" if enabled else "disabled"
+    )
+    provider._ygobench_thinking_control = "minimax.extra_body.thinking.type"
+    provider.thinking_enabled = enabled
+    if not enabled and hasattr(provider, "reasoning_effort"):
+        provider.reasoning_effort = None
+    if getattr(provider, "_ygobench_minimax_m3_thinking_toggle_wrapped", False):
+        return provider
+
+    completions = provider._client.chat.completions
+    create = completions.create
+
+    @wraps(create)
+    def create_with_explicit_minimax_thinking(*args: Any, **kwargs: Any) -> Any:
+        raw_extra_body = kwargs.get("extra_body")
+        extra_body = dict(raw_extra_body) if isinstance(raw_extra_body, Mapping) else {}
+        thinking = extra_body.get("thinking")
+        thinking = dict(thinking) if isinstance(thinking, Mapping) else {}
+        thinking["type"] = provider._ygobench_minimax_m3_thinking_mode
+        extra_body["thinking"] = thinking
+        kwargs["extra_body"] = extra_body
+        return create(*args, **kwargs)
+
+    completions.create = create_with_explicit_minimax_thinking
+    provider._ygobench_minimax_m3_thinking_toggle_wrapped = True
+    return provider
+
+
 def force_openai_thinking_disabled(provider: Any) -> Any:
     """Send the OpenAI-compatible non-reasoning setting on every request.
 
@@ -469,7 +499,10 @@ def force_openai_thinking_disabled(provider: Any) -> Any:
 
 
 def force_provider_thinking_disabled(
-    provider: Any, *, provider_name: str | None = None
+    provider: Any,
+    *,
+    provider_name: str | None = None,
+    model_name: str | None = None,
 ) -> Any:
     """Apply the provider-specific thinking policy at the SDK boundary.
 
@@ -482,6 +515,8 @@ def force_provider_thinking_disabled(
     if name == "deepseek":
         return force_deepseek_thinking_mode(provider, enabled=False)
     if name in {"bailian", "dashscope", "qwen"}:
+        if model_name and model_name.rsplit("/", 1)[-1].lower() == "minimax-m3":
+            return force_minimax_m3_thinking_mode(provider, enabled=False)
         return force_qwen_thinking_mode(provider, enabled=False)
     if name in {"openai", "azopenai"}:
         return force_openai_thinking_disabled(provider)

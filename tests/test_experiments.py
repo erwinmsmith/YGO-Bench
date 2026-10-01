@@ -345,7 +345,7 @@ def test_provider_failure_is_unrated_and_keeps_retryable_prefix(monkeypatch, tmp
     assert failures[0]["validation"]["api_error"]
     assert TaskRegistry(tmp_path / config.run_id / "task_state.sqlite").row(config.game_id)[
         "status"
-    ] == "FAILED_RETRYABLE"
+    ] == "PAUSED_NETWORK"
 
 
 def test_engine_failure_has_no_deterministic_action_fallback(monkeypatch, tmp_path) -> None:
@@ -532,6 +532,31 @@ def test_dashscope_probe_requests_explicitly_disable_thinking() -> None:
     assert provider.thinking_enabled is False
 
 
+def test_minimax_m3_requests_its_explicit_thinking_disable_parameter() -> None:
+    captured = {}
+
+    def create(**kwargs):
+        captured.update(kwargs)
+        return "ok"
+
+    provider = SimpleNamespace(
+        name="dashscope",
+        thinking_enabled=True,
+        _client=SimpleNamespace(
+            chat=SimpleNamespace(completions=SimpleNamespace(create=create))
+        ),
+    )
+    force_provider_thinking_disabled(
+        provider,
+        provider_name="bailian",
+        model_name="MiniMax/MiniMax-M3",
+    )
+
+    assert provider._client.chat.completions.create(model="MiniMax/MiniMax-M3") == "ok"
+    assert captured["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert provider.thinking_enabled is False
+
+
 def test_openai_compatible_requests_are_uncapped_and_disable_thinking() -> None:
     captured = {}
 
@@ -617,14 +642,16 @@ def test_gagawenai_gemini_adapts_messages_tools_and_usage() -> None:
 
     assert result.usage.reasoning_tokens == 17
     assert provider.name == "gagawenai-gemini"
-    assert "tools" in captured
+    assert "tools" not in captured
     assert "parallel_tool_calls" not in captured
     assert "reasoning_effort" not in captured
     assert captured["extra_body"]["existing"] is True
     assert captured["extra_body"]["systemInstruction"] == {
         "parts": [{"text": "Use one tool."}]
     }
-    assert captured["tools"][0]["function"]["name"] == "inspect_cards"
+    assert captured["extra_body"]["tools"][0]["functionDeclarations"][0][
+        "name"
+    ] == "inspect_cards"
     contents = captured["extra_body"]["contents"]
     assert contents[1]["parts"][0]["functionCall"] == {
         "name": "inspect_cards",
@@ -700,10 +727,10 @@ def test_gagawenai_gemini_adapts_ygo_tool_schema() -> None:
         ],
     )
 
-    declaration = captured["tools"][0]["function"]
+    assert "tools" not in captured
+    declaration = captured["extra_body"]["tools"][0]["functionDeclarations"][0]
     assert declaration["name"] == "select_chain"
     assert declaration["parameters"]["required"] == ["index"]
-    assert "tools" not in captured["extra_body"]
 def test_gagawenai_gemini_normalizes_tool_names() -> None:
     captured = {}
 
@@ -740,8 +767,8 @@ def test_gagawenai_gemini_normalizes_tool_names() -> None:
     )
 
     names = [
-        item["function"]["name"]
-        for item in captured["tools"]
+        item["name"]
+        for item in captured["extra_body"]["tools"][0]["functionDeclarations"]
     ]
     assert names == ["select_chain"]
 

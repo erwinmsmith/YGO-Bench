@@ -364,7 +364,11 @@ class LLMFullDuelAgent(BaseAgent):
         if model.provider == "gagawenai-gemini":
             force_gagawenai_gemini_thinking_low(self._provider)
         else:
-            force_provider_thinking_disabled(self._provider, provider_name=model.provider)
+            force_provider_thinking_disabled(
+                self._provider,
+                provider_name=model.provider,
+                model_name=model.model,
+            )
         self._tool_defs = {tool["name"]: tool for tool in tools_module.TOOLS}
         # Full-duel tool protocol v3 replaces repeated single-card lookups with
         # exactly one batch-inspection round per engine decision.

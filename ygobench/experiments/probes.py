@@ -122,7 +122,11 @@ def _provider(provider_name: str | None = None, model: str | None = None):
     if config.provider == "gagawenai-gemini":
         force_gagawenai_gemini_thinking_low(provider)
     else:
-        force_provider_thinking_disabled(provider, provider_name=config.provider)
+        force_provider_thinking_disabled(
+            provider,
+            provider_name=config.provider,
+            model_name=config.model,
+        )
     return provider
 
 
