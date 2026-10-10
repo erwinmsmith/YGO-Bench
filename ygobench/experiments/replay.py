@@ -31,6 +31,11 @@ def verify_reversible_decisions(
         deck_root / f"{config['deck1']}.ydk",
         deck_root / f"{config['deck2']}.ydk",
         seed=int(config["seed"]),
+        deck_shuffle_seeds=(
+            tuple(config["deck_shuffle_seeds"])
+            if config.get("deck_shuffle_seeds") is not None
+            else None
+        ),
     )
     results = []
     recent_actions: list[dict[str, Any]] = []

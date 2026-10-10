@@ -43,6 +43,13 @@ def build_parser() -> argparse.ArgumentParser:
     duel.add_argument("--agent2", default="react-fast:deepseek:deepseek-v4-flash")
     duel.add_argument("--seed", type=int, default=1)
     duel.add_argument(
+        "--deck-shuffle-seeds",
+        type=int,
+        nargs=2,
+        metavar=("PLAYER0_SEED", "PLAYER1_SEED"),
+        help="Optional per-seat deck seeds; paired seat swaps can reverse these values.",
+    )
+    duel.add_argument(
         "--max-decisions", type=int, default=0,
         help="Maximum decisions; 0 runs a full duel without a decision cap.",
     )
@@ -154,6 +161,9 @@ def main() -> int:
             agent1=args.agent1,
             agent2=args.agent2,
             seed=args.seed,
+            deck_shuffle_seeds=(
+                tuple(args.deck_shuffle_seeds) if args.deck_shuffle_seeds is not None else None
+            ),
             max_decisions=args.max_decisions,
         )
         result = run_evidence_duel(config, root=root)

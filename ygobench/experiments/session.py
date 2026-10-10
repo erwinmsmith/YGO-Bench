@@ -20,7 +20,14 @@ from ygobench.experiments.oracle import build_oracle_state
 
 
 class DuelSession:
-    def __init__(self, deck1: Path, deck2: Path, *, seed: int) -> None:
+    def __init__(
+        self,
+        deck1: Path,
+        deck2: Path,
+        *,
+        seed: int,
+        deck_shuffle_seeds: tuple[int, int] | None = None,
+    ) -> None:
         (
             self.layout,
             self.core,
@@ -40,7 +47,11 @@ class DuelSession:
         self.engine_seeds = _create_match(
             self.engine, self.core, seed=seed, flags=self.core.DUEL_MODE_MR5
         )
-        self.deck_shuffle_seeds = _derive_deck_shuffle_seeds(seed)
+        self.deck_shuffle_seeds = (
+            deck_shuffle_seeds
+            if deck_shuffle_seeds is not None
+            else _derive_deck_shuffle_seeds(seed)
+        )
         self.deck_order_hashes = (
             _add_deck(
                 self.engine,

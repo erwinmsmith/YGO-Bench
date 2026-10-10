@@ -294,11 +294,21 @@ def _audit_candidate(
         deck_root / f"{config['deck1']}.ydk",
         deck_root / f"{config['deck2']}.ydk",
         seed=int(config["seed"]),
+        deck_shuffle_seeds=(
+            tuple(config["deck_shuffle_seeds"])
+            if config.get("deck_shuffle_seeds") is not None
+            else None
+        ),
     )
     counterfactual_session = DuelSession(
         deck_root / f"{config['deck1']}.ydk",
         deck_root / f"{config['deck2']}.ydk",
         seed=int(config["seed"]),
+        deck_shuffle_seeds=(
+            tuple(config["deck_shuffle_seeds"])
+            if config.get("deck_shuffle_seeds") is not None
+            else None
+        ),
     )
     try:
         clean_recent = _replay_prefix(clean_session, rows, response_index)

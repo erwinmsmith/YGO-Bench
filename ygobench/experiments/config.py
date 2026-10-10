@@ -28,6 +28,7 @@ class ExperimentConfig:
     agent2: str
     seed: int
     max_decisions: int = 0
+    deck_shuffle_seeds: tuple[int, int] | None = None
     # The schema version changes only when persisted evidence compatibility changes.
     schema_version: str = "3.0.0"
     checkpoint_interval: int = 25
@@ -44,10 +45,19 @@ class ExperimentConfig:
         agent2: str,
         seed: int,
         max_decisions: int = 0,
+        deck_shuffle_seeds: tuple[int, int] | None = None,
         game_id: str | None = None,
         checkpoint_interval: int = 25,
         resume: bool = True,
     ) -> ExperimentConfig:
+        if deck_shuffle_seeds is not None and (
+            len(deck_shuffle_seeds) != 2
+            or any(
+                isinstance(value, bool) or not isinstance(value, int)
+                for value in deck_shuffle_seeds
+            )
+        ):
+            raise ValueError("deck_shuffle_seeds must contain two integers")
         identity = {
             "run_id": run_id,
             "deck1": deck1,
@@ -60,6 +70,8 @@ class ExperimentConfig:
             "resume": resume,
             "schema_version": cls.__dataclass_fields__["schema_version"].default,
         }
+        if deck_shuffle_seeds is not None:
+            identity["deck_shuffle_seeds"] = deck_shuffle_seeds
         return cls(
             run_id=run_id,
             game_id=game_id or stable_id("game", identity),
@@ -69,12 +81,19 @@ class ExperimentConfig:
             agent2=agent2,
             seed=seed,
             max_decisions=max_decisions,
+            deck_shuffle_seeds=deck_shuffle_seeds,
             checkpoint_interval=checkpoint_interval,
             resume=resume,
         )
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        # Preserve hashes and resume compatibility for historical duels.
+        if self.deck_shuffle_seeds is None:
+            data.pop("deck_shuffle_seeds")
+        else:
+            data["deck_shuffle_seeds"] = list(self.deck_shuffle_seeds)
+        return data
 
     def hash(self) -> str:
         return hashlib.sha256(canonical_json(self.to_dict()).encode()).hexdigest()

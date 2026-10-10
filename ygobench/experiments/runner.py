@@ -284,7 +284,11 @@ def _manifest(config: ExperimentConfig, game_dir: Path, agents: tuple[Any, Any])
         "native_engine_serialization": False,
         "randomization": {
             "engine_seed": config.seed,
-            "deck_shuffle_seeds": list(_derive_deck_shuffle_seeds(config.seed)),
+            "deck_shuffle_seeds": list(
+                config.deck_shuffle_seeds
+                if config.deck_shuffle_seeds is not None
+                else _derive_deck_shuffle_seeds(config.seed)
+            ),
             "deck_shuffle_algorithm": "python_random_fisher_yates_v1",
             "llm_sampling": "provider_non_deterministic_unless_provider_seed_is_supported",
         },
@@ -409,6 +413,7 @@ def run_evidence_duel(
             deck_root / f"{config.deck1}.ydk",
             deck_root / f"{config.deck2}.ydk",
             seed=config.seed,
+            deck_shuffle_seeds=config.deck_shuffle_seeds,
         )
         last_stable_lp = [max(0, int(value)) for value in session.duel.state.lp]
         decision_index = 0
