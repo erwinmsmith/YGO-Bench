@@ -47,9 +47,14 @@ def _json(value: Any) -> str:
 
 
 def _turn_snapshot(turn: Any) -> dict[str, Any]:
-    # Provider reasoning text and credentials are deliberately excluded. Tool
-    # call IDs and arguments are sufficient to continue the game conversation.
+    # Recovery snapshots, unlike evidence logs, must retain reasoning content
+    # so the provider can continue a tool call after a restart.
+    source_data = getattr(turn, "provider_data", {}) or {}
+    provider_data = scrub_reasoning_content(source_data)
+    if "reasoning_content" in source_data:
+        provider_data["reasoning_content"] = source_data["reasoning_content"]
     return {
+        "snapshot_version": 2,
         "text": str(getattr(turn, "text", "")),
         "tool_calls": [
             {"id": call.id, "name": call.name, "arguments": call.arguments}
@@ -63,13 +68,12 @@ def _turn_snapshot(turn: Any) -> dict[str, Any]:
             for key, value in (getattr(turn, "response_headers", {}) or {}).items()
             if key.lower() in {"x-request-id", "x-oneapi-request-id", "request-id"}
         },
-        "provider_data": scrub_reasoning_content(
-            getattr(turn, "provider_data", {}) or {}
-        ),
+        "provider_data": provider_data,
     }
 
 
 def _restored_turn(snapshot: dict[str, Any]) -> Any:
+    # Legacy snapshots without a version remain readable; lost reasoning cannot be recovered.
     return SimpleNamespace(
         text=snapshot["text"],
         tool_calls=[SimpleNamespace(**call) for call in snapshot["tool_calls"]],
