@@ -12,9 +12,9 @@ from typing import Any
 from ygobench.agents.base import BaseAgent
 from ygobench.agents.provider_limits import (
     adapt_gagawenai_gemini,
-    force_gagawenai_gemini_thinking_low,
-    force_provider_thinking_disabled,
+    configure_provider_thinking,
     force_single_tool_call,
+    minimum_thinking_configuration,
     omit_provider_token_limit,
     scrub_reasoning_content,
 )
@@ -359,16 +359,11 @@ class LLMFullDuelAgent(BaseAgent):
         # while avoiding a provider-specific unsupported request parameter.
         if backend != "dashscope" and not qwen_compatible:
             force_single_tool_call(self._provider)
-        if thinking_enabled:
-            raise ValueError("Formal YGO-Bench runs require thinking_enabled=False")
-        if model.provider == "gagawenai-gemini":
-            force_gagawenai_gemini_thinking_low(self._provider)
-        else:
-            force_provider_thinking_disabled(
-                self._provider,
-                provider_name=model.provider,
-                model_name=model.model,
-            )
+        if thinking_enabled and not minimum_thinking_configuration(model.provider, model.model):
+            raise ValueError("This model has no configured formal thinking-enabled policy")
+        configure_provider_thinking(
+            self._provider, provider_name=model.provider, model_name=model.model
+        )
         self._tool_defs = {tool["name"]: tool for tool in tools_module.TOOLS}
         # Full-duel tool protocol v3 replaces repeated single-card lookups with
         # exactly one batch-inspection round per engine decision.
@@ -392,6 +387,9 @@ class LLMFullDuelAgent(BaseAgent):
         )
         self.provider_config["reasoning_effort"] = getattr(
             self._provider, "reasoning_effort", None
+        )
+        self.provider_config.update(
+            getattr(self._provider, "_ygobench_reasoning_configuration", {})
         )
         self.provider_config["max_tokens"] = None
         self.provider_config["token_limit_policy"] = "omitted_from_request"

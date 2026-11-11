@@ -5,8 +5,96 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from functools import wraps
 from typing import Any
+
+# Only the seven explicitly selected models opt into the new experiment policy.
+# Provider prefixes and casing are normalized for lookup; the wire model ID is
+# preserved. CJRouter uses the existing "external" OpenAI-compatible profile.
+_MINIMUM_THINKING_MODELS = {
+    "qwen3.8-flash": "enable_thinking",
+    "deepseek-v4.1-flash-1017": "thinking",
+    "minimax-m3.1-flash": None,
+    "glm-5.3-flash": "thinking",
+    "doubao-seed-2.1-lite": "thinking",
+    "gemini-3.8-flash": None,
+    "gpt-6-luna": None,
+}
+_MINIMUM_THINKING_PROVIDERS = {
+    "external", "openai", "azopenai", "deepseek", "bailian", "dashscope",
+    "qwen", "gagawenai-gemini",
+}
+
+
+def minimum_thinking_configuration(
+    provider_name: str, model_name: str
+) -> dict[str, Any] | None:
+    """Describe requested wire settings, not a claim of upstream enforcement."""
+    model = model_name.strip().rsplit("/", 1)[-1].lower()
+    if (
+        provider_name not in _MINIMUM_THINKING_PROVIDERS
+        or model not in _MINIMUM_THINKING_MODELS
+    ):
+        return None
+    wire: dict[str, Any] = {"reasoning_effort": "low"}
+    toggle = _MINIMUM_THINKING_MODELS[model]
+    if toggle == "enable_thinking":
+        wire["enable_thinking"] = True
+    elif toggle == "thinking":
+        wire["thinking"] = {"type": "enabled"}
+    config: dict[str, Any] = {
+        "thinking_enabled": True,
+        "reasoning_effort": "low",
+        "thinking_control": "model-minimum-v1",
+        "reasoning_policy": "model-minimum-v1",
+        "reasoning_request": wire,
+    }
+    return config
+
+
+def configure_provider_thinking(
+    provider: Any, *, provider_name: str, model_name: str
+) -> Any:
+    """Apply model minimums on every call; retain legacy policies elsewhere."""
+    config = minimum_thinking_configuration(provider_name, model_name)
+    if config is None:
+        if provider_name == "gagawenai-gemini":
+            return force_gagawenai_gemini_thinking_low(provider)
+        return force_provider_thinking_disabled(
+            provider, provider_name=provider_name, model_name=model_name
+        )
+    if getattr(provider, "_ygobench_minimum_thinking", False):
+        return provider
+    provider.thinking_enabled = True
+    provider.reasoning_effort = "low"
+    provider._ygobench_thinking_control = config["thinking_control"]
+    provider._ygobench_reasoning_configuration = deepcopy(config)
+    completions = provider._client.chat.completions
+    create = completions.create
+
+    @wraps(create)
+    def create_with_minimum_thinking(*args: Any, **kwargs: Any) -> Any:
+        extra = dict(kwargs.get("extra_body") or {})
+        # extra_body overrides SDK parameters; remove conflicting old controls
+        # from both locations so retries cannot silently restore "none"/off.
+        for key in (
+            "thinking", "enable_thinking", "reasoning_effort", "thinking_budget", "reasoning"
+        ):
+            kwargs.pop(key, None)
+            extra.pop(key, None)
+        wire = deepcopy(config["reasoning_request"])
+        kwargs["reasoning_effort"] = wire.pop("reasoning_effort")
+        extra.update(wire)
+        if extra:
+            kwargs["extra_body"] = extra
+        else:
+            kwargs.pop("extra_body", None)
+        return create(*args, **kwargs)
+
+    completions.create = create_with_minimum_thinking
+    provider._ygobench_minimum_thinking = True
+    return provider
 
 
 def scrub_reasoning_content(value: Any) -> Any:

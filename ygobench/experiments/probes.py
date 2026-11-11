@@ -14,8 +14,8 @@ from typing import Any, Literal, TypeVar
 from ygobench.agents.llm_agent import compact_prompt_state
 from ygobench.agents.provider_limits import (
     adapt_gagawenai_gemini,
-    force_gagawenai_gemini_thinking_low,
-    force_provider_thinking_disabled,
+    configure_provider_thinking,
+    minimum_thinking_configuration,
     omit_provider_token_limit,
 )
 from ygobench.config import default_model_config
@@ -50,25 +50,28 @@ def _probe_policy_descriptor(
     provider_name: str | None = None, model: str | None = None
 ) -> dict[str, Any]:
     config = default_model_config(provider=provider_name, model=model)
+    reasoning = minimum_thinking_configuration(config.provider, config.model) or {}
     gemini_low = config.provider == "gagawenai-gemini"
+    thinking_enabled = bool(reasoning) or gemini_low
     descriptor = policy_descriptor(
         f"react-fast:{config.provider}:{config.model}",
         runtime={
             "provider": config.provider,
             "model": config.model,
             "backend": config.backend,
-            "thinking_enabled": gemini_low,
-            "reasoning_effort": "low" if gemini_low else None,
+            "thinking_enabled": thinking_enabled,
+            "reasoning_effort": "low" if thinking_enabled else None,
             "temperature": 0.0,
             "max_tokens": None,
+            **reasoning,
         },
     )
     descriptor.update(
         {
             "task_profile": "post_hoc_public_state_and_forecast_v2",
-            "thinking_enabled": gemini_low,
-            "reasoning_mode": "low" if gemini_low else "disabled",
-            "thinking_control": (
+            "thinking_enabled": thinking_enabled,
+            "reasoning_mode": "low" if thinking_enabled else "disabled",
+            "thinking_control": reasoning.get("thinking_control") or (
                 "gagawenai-gemini.reasoning_effort"
                 if gemini_low
                 else "explicit-provider-wire-disable-v1"
@@ -119,14 +122,9 @@ def _provider(provider_name: str | None = None, model: str | None = None):
     if config.provider == "gagawenai-gemini":
         adapt_gagawenai_gemini(provider)
     omit_provider_token_limit(provider)
-    if config.provider == "gagawenai-gemini":
-        force_gagawenai_gemini_thinking_low(provider)
-    else:
-        force_provider_thinking_disabled(
-            provider,
-            provider_name=config.provider,
-            model_name=config.model,
-        )
+    configure_provider_thinking(
+        provider, provider_name=config.provider, model_name=config.model
+    )
     return provider
 
 

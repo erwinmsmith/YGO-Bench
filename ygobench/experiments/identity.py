@@ -56,6 +56,8 @@ def policy_descriptor(
             "thinking_enabled",
             "thinking_control",
             "reasoning_effort",
+            "reasoning_policy",
+            "reasoning_request",
             "temperature",
             "max_tokens",
             "token_limit_policy",
@@ -89,6 +91,9 @@ def model_configuration_id(descriptor: dict[str, Any]) -> str:
             "runtime_token_limit_policy", descriptor.get("token_limit_policy")
         ),
     }
+    if descriptor.get("runtime_reasoning_policy"):
+        value["reasoning_policy"] = descriptor["runtime_reasoning_policy"]
+        value["reasoning_request"] = descriptor.get("runtime_reasoning_request")
     return stable_id("modelcfg", value, length=24)
 
 
