@@ -18,6 +18,7 @@ _MINIMUM_THINKING_MODELS = {
     "minimax-m3.1-flash": None,
     "glm-5.3-flash": "thinking",
     "doubao-seed-2.1-lite": "thinking",
+    "doubao-seed-2-1-lite-260915": "thinking",
     "gemini-3.8-flash": None,
     "gpt-6-luna": None,
 }
