@@ -18,6 +18,7 @@ from ygobench.agents.provider_limits import (
     omit_provider_token_limit,
     scrub_reasoning_content,
 )
+from ygobench.agents.provider_streaming import configure_cjrouter_streaming
 from ygobench.config import ModelConfig
 from ygobench.engine.protocol import ActionChoice, DecisionRequest
 from ygobench.engine.upstream import UpstreamLayout
@@ -363,6 +364,9 @@ class LLMFullDuelAgent(BaseAgent):
             raise ValueError("This model has no configured formal thinking-enabled policy")
         configure_provider_thinking(
             self._provider, provider_name=model.provider, model_name=model.model
+        )
+        configure_cjrouter_streaming(
+            self._provider, provider_name=model.provider, base_url=model.base_url
         )
         self._tool_defs = {tool["name"]: tool for tool in tools_module.TOOLS}
         # Full-duel tool protocol v3 replaces repeated single-card lookups with

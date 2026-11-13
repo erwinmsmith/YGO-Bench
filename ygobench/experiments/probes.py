@@ -18,6 +18,10 @@ from ygobench.agents.provider_limits import (
     minimum_thinking_configuration,
     omit_provider_token_limit,
 )
+from ygobench.agents.provider_streaming import (
+    cjrouter_streaming_configuration,
+    configure_cjrouter_streaming,
+)
 from ygobench.config import default_model_config
 from ygobench.engine.upstream import UpstreamLayout
 from ygobench.experiments.config import stable_id
@@ -64,6 +68,7 @@ def _probe_policy_descriptor(
             "temperature": 0.0,
             "max_tokens": None,
             **reasoning,
+            **cjrouter_streaming_configuration(config.provider, config.base_url),
         },
     )
     descriptor.update(
@@ -124,6 +129,9 @@ def _provider(provider_name: str | None = None, model: str | None = None):
     omit_provider_token_limit(provider)
     configure_provider_thinking(
         provider, provider_name=config.provider, model_name=config.model
+    )
+    configure_cjrouter_streaming(
+        provider, provider_name=config.provider, base_url=config.base_url
     )
     return provider
 

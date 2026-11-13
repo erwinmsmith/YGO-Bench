@@ -62,6 +62,9 @@ def policy_descriptor(
             "temperature",
             "max_tokens",
             "token_limit_policy",
+            "response_transport",
+            "stream",
+            "stream_options",
         ):
             if key in runtime:
                 descriptor[f"runtime_{key}"] = runtime[key]
