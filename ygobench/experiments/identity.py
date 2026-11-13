@@ -8,9 +8,10 @@ from ygobench.experiments.config import stable_id
 
 POLICY_IDENTITY_VERSION = "3.0.0"
 TOOL_SCHEMA_VERSION = "full-duel-tools-v4-batch-inspection-cache"
-CONTEXT_POLICY = "compact-public-state-with-duel-card-cache-v2"
+CONTEXT_POLICY = "compact-public-state-with-duel-card-cache-sorted-json-v3"
 RETRY_POLICY = {
     "model_action_attempts": 3,
+    "engine_rejection_action": "verified_prefix_replay_then_model_correction",
     "provider_attempts": 3,
     "provider_retry_delays_seconds": [10.0, 10.0],
     "model_failure_action": "rated_forfeit",

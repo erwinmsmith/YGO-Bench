@@ -19,6 +19,10 @@ from ygobench.experiments.legal import build_legal_evidence, canonical_engine_ar
 from ygobench.experiments.oracle import build_oracle_state
 
 
+class EngineResponseRejected(RuntimeError):
+    """The engine explicitly rejected the submitted response (MSG_RETRY)."""
+
+
 class DuelSession:
     def __init__(
         self,
@@ -105,7 +109,12 @@ class DuelSession:
 
     def execute(self, action: Any) -> Any:
         method = getattr(self.duel, self.tools_module.TOOL_TO_HARNESS_METHOD[action.tool])
-        self.step_result = method(**_normalize_action(action, self.core, self.tools_module))
+        try:
+            self.step_result = method(**_normalize_action(action, self.core, self.tools_module))
+        except self.harness_module.HarnessError as exc:
+            if str(exc).startswith("Engine rejected response (MSG_RETRY "):
+                raise EngineResponseRejected(str(exc)) from exc
+            raise
         return self.step_result
 
     def action_signature(self, action: Any) -> tuple[str, dict[str, Any]]:

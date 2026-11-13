@@ -32,7 +32,7 @@ from ygobench.experiments.legal import exact_legal_action_match
 from ygobench.experiments.oracle import build_oracle_state
 from ygobench.experiments.recovery import RecoveryConflict, RecoveryStore, pause_status
 from ygobench.experiments.registry import LeaseHeartbeat, TaskRegistry
-from ygobench.experiments.session import DuelSession
+from ygobench.experiments.session import DuelSession, EngineResponseRejected
 
 MAX_MODEL_ACTION_ATTEMPTS = 3
 
@@ -295,6 +295,42 @@ def _manifest(config: ExperimentConfig, game_dir: Path, agents: tuple[Any, Any])
     }
 
 
+def _restore_rejected_session(
+    config: ExperimentConfig, rows: list[dict[str, Any]], expected_view: dict[str, Any]
+) -> DuelSession:
+    """Discard a rejected engine and verify the successful prefix before correcting."""
+    deck_root = PROJECT_ROOT / "resources" / "decks"
+    restored = DuelSession(
+        deck_root / f"{config.deck1}.ydk",
+        deck_root / f"{config.deck2}.ydk",
+        seed=config.seed,
+        deck_shuffle_seeds=config.deck_shuffle_seeds,
+    )
+    recent_actions: list[dict[str, Any]] = []
+    try:
+        for row in rows:
+            view = restored.view(recent_actions)
+            if (
+                view["oracle"]["state_hash"] != row["oracle_before_hash"]
+                or content_hash(view["legal"]) != content_hash(row["legal"])
+            ):
+                raise RuntimeError("engine correction replay state/legality mismatch")
+            restored.execute(ActionChoice(**row["executed_action"]))
+            if build_oracle_state(restored)["state_hash"] != row["oracle_after_hash"]:
+                raise RuntimeError("engine correction replay transition mismatch")
+            recent_actions.append(row["action_summary"])
+        view = restored.view(recent_actions)
+        if any(
+            content_hash(view[key]) != content_hash(expected_view[key])
+            for key in ("player", "oracle", "legal", "observation")
+        ):
+            raise RuntimeError("engine correction replay pending decision mismatch")
+    except BaseException:
+        restored.close()
+        raise
+    return restored
+
+
 def run_evidence_duel(
     config: ExperimentConfig,
     *,
@@ -549,7 +585,6 @@ def run_evidence_duel(
                     )
             attempted_invalid = agent_error is not None
             recovery = "model_retry_exhausted_forfeit" if terminal_model_failure else "none"
-            elapsed = time.perf_counter() - call_started
             diagnostics = _trace_diagnostics(trace, expected)
 
             exact_legal_check_performed = bool(view["legal"]["enumeration_complete"])
@@ -584,117 +619,152 @@ def run_evidence_duel(
                     or (exact_legal_check_performed and not exact_legal_match)
                 )
             )
-            if needs_model_correction:
-                if pre_engine_error is None and exact_legal_check_performed:
-                    pre_engine_error = (
-                        f"action_not_in_exact_legal_set: {executed.tool} {executed.arguments!r}"
-                    )
-                attempted_invalid = True
-                correction_trace = {"attempts": []}
-                for correction_number in range(
-                    model_action_attempts + 1, MAX_MODEL_ACTION_ATTEMPTS + 1
-                ):
-                    model_action_attempts = correction_number
-                    corrected: ActionChoice | None = None
-                    attempt_trace: dict[str, Any]
-                    if decision_index in interventions or not hasattr(
-                        agent, "correct_invalid_action"
+            engine_rejections: list[dict[str, Any]] = []
+            engine_submission_attempted = False
+            after = before
+            step = None
+            while not terminal_model_failure and not decision_technical_failure:
+                if needs_model_correction:
+                    if pre_engine_error is None and exact_legal_check_performed:
+                        pre_engine_error = (
+                            f"action_not_in_exact_legal_set: {executed.tool} {executed.arguments!r}"
+                        )
+                    attempted_invalid = True
+                    if correction_trace is None:
+                        correction_trace = {"attempts": []}
+                    for correction_number in range(
+                        model_action_attempts + 1, MAX_MODEL_ACTION_ATTEMPTS + 1
                     ):
-                        attempt_trace = {"error": "no_model_correction_available"}
-                    else:
+                        model_action_attempts = correction_number
+                        corrected: ActionChoice | None = None
+                        attempt_trace: dict[str, Any]
+                        if decision_index in interventions or not hasattr(
+                            agent, "correct_invalid_action"
+                        ):
+                            attempt_trace = {"error": "no_model_correction_available"}
+                        else:
+                            try:
+                                if engine_rejections:
+                                    corrected, attempt_trace = agent.correct_invalid_action(
+                                        request, rejections=engine_rejections
+                                    )
+                                else:
+                                    corrected, attempt_trace = agent.correct_invalid_action(request)
+                            except ProviderCallError as exc:
+                                api_error = f"ProviderCallError: {exc}"
+                                decision_technical_failure = True
+                                technical_failure_type = "api_failure"
+                                technical_failure_error = api_error
+                                technical_failure_player = player
+                                technical_pause_status = pause_status(exc)
+                                termination = "api_failure_abort"
+                                attempt_trace = {
+                                    "exception": api_error,
+                                    "provider_transport_attempts": getattr(exc, "attempts", []),
+                                }
+                            except ProviderProtocolError as exc:
+                                model_error = f"ProviderProtocolError: {exc}"
+                                attempt_trace = {
+                                    "exception": model_error,
+                                    "provider_protocol_diagnostics": getattr(
+                                        exc, "diagnostics", None
+                                    ),
+                                }
+                            except Exception as exc:  # noqa: BLE001
+                                if isinstance(exc, RecoveryConflict):
+                                    raise
+                                technical_failure_error = f"{type(exc).__name__}: {exc}"
+                                decision_technical_failure = True
+                                technical_failure_type = "agent_runtime_failure"
+                                technical_failure_player = player
+                                termination = "agent_runtime_failure_abort"
+                                attempt_trace = {"exception": technical_failure_error}
+                        correction_trace["attempts"].append(
+                            {
+                                "attempt": correction_number,
+                                "action": asdict(corrected) if corrected is not None else None,
+                                "trace": attempt_trace,
+                            }
+                        )
+                        if decision_technical_failure:
+                            break
                         try:
-                            corrected, attempt_trace = agent.correct_invalid_action(request)
-                        except ProviderCallError as exc:
-                            api_error = f"ProviderCallError: {exc}"
-                            decision_technical_failure = True
-                            technical_failure_type = "api_failure"
-                            technical_failure_error = api_error
-                            technical_failure_player = player
-                            technical_pause_status = pause_status(exc)
-                            termination = "api_failure_abort"
-                            attempt_trace = {
-                                "exception": api_error,
-                                "provider_transport_attempts": getattr(exc, "attempts", []),
-                            }
-                        except ProviderProtocolError as exc:
-                            model_error = f"ProviderProtocolError: {exc}"
-                            attempt_trace = {
-                                "exception": model_error,
-                                "provider_protocol_diagnostics": getattr(
-                                    exc, "diagnostics", None
-                                ),
-                            }
-                        except Exception as exc:  # noqa: BLE001
-                            if isinstance(exc, RecoveryConflict):
-                                raise
-                            technical_failure_error = f"{type(exc).__name__}: {exc}"
-                            decision_technical_failure = True
-                            technical_failure_type = "agent_runtime_failure"
-                            technical_failure_player = player
-                            termination = "agent_runtime_failure_abort"
-                            attempt_trace = {"exception": technical_failure_error}
-                    correction_trace["attempts"].append(
-                        {
-                            "attempt": correction_number,
-                            "action": asdict(corrected) if corrected is not None else None,
-                            "trace": attempt_trace,
-                        }
-                    )
-                    if decision_technical_failure:
-                        break
-                    try:
-                        correction_is_legal = (
-                            corrected is not None
-                            and corrected.tool == expected
-                            and (
-                                not exact_legal_check_performed
-                                or exact_legal_action_match(
-                                    corrected,
-                                    view["actions"],
-                                    signature=session.action_signature,
+                            correction_is_legal = (
+                                corrected is not None
+                                and corrected.tool == expected
+                                and (
+                                    not exact_legal_check_performed
+                                    or exact_legal_action_match(
+                                        corrected,
+                                        view["actions"],
+                                        signature=session.action_signature,
+                                    )
                                 )
                             )
-                        )
-                    except (KeyError, TypeError, ValueError) as exc:
-                        correction_is_legal = False
-                        correction_trace["attempts"][-1]["validation_error"] = (
-                            f"action_argument_validation_failed: {type(exc).__name__}: {exc}"
-                        )
-                    if correction_is_legal:
-                        executed = corrected
-                        recovery = "corrected_retry"
-                        break
-                else:
-                    executed = None
-                    terminal_model_failure = True
-                    recovery = "model_retry_exhausted_forfeit"
-                    forfeit_winner = 1 - player
-                    termination = "model_retry_exhausted_forfeit"
+                        except (KeyError, TypeError, ValueError) as exc:
+                            correction_is_legal = False
+                            correction_trace["attempts"][-1]["validation_error"] = (
+                                f"action_argument_validation_failed: {type(exc).__name__}: {exc}"
+                            )
+                        if correction_is_legal:
+                            executed = corrected
+                            recovery = "corrected_retry"
+                            break
+                    else:
+                        executed = None
+                        terminal_model_failure = True
+                        recovery = "model_retry_exhausted_forfeit"
+                        forfeit_winner = 1 - player
+                        termination = "model_retry_exhausted_forfeit"
 
-            if terminal_model_failure or decision_technical_failure:
-                after = before
-                step = None
-            else:
-                assert executed is not None
-                try:
-                    step = session.execute(executed)
-                except Exception as exc:  # noqa: BLE001
-                    engine_rejection_error = f"{type(exc).__name__}: {exc}"
-                    engine_error = engine_rejection_error
-                    decision_technical_failure = True
-                    technical_failure_type = "engine_failure"
-                    technical_failure_error = engine_error
-                    technical_failure_player = player
-                    termination = "engine_failure_abort"
-                    recovery = "none"
-                    step = None
-                    after = before
+                if terminal_model_failure or decision_technical_failure:
+                    break
                 else:
-                    after = build_oracle_state(session)
-                    last_stable_lp = [
-                        max(0, int(value))
-                        for value in after.get("tracked", {}).get("lp", last_stable_lp)
-                    ]
+                    assert executed is not None
+                    try:
+                        engine_submission_attempted = True
+                        step = session.execute(executed)
+                    except Exception as exc:  # noqa: BLE001
+                        engine_rejection_error = f"{type(exc).__name__}: {exc}"
+                        if (
+                            isinstance(exc, EngineResponseRejected)
+                            and not exact_legal_check_performed
+                        ):
+                            attempted_invalid = True
+                            engine_rejections.append({
+                                "action": {"tool": executed.tool, "arguments": executed.arguments},
+                                "error": str(exc),
+                            })
+                            try:
+                                restored = _restore_rejected_session(
+                                    config, [*(replay_prefix or []), *public.recover()], view
+                                )
+                            except Exception as restore_error:  # noqa: BLE001
+                                exc = restore_error
+                            else:
+                                session.close()
+                                session = restored
+                                needs_model_correction = True
+                                continue
+                        engine_error = f"{type(exc).__name__}: {exc}"
+                        decision_technical_failure = True
+                        technical_failure_type = "engine_failure"
+                        technical_failure_error = engine_error
+                        technical_failure_player = player
+                        termination = "engine_failure_abort"
+                        recovery = "none"
+                        step = None
+                        after = before
+                    else:
+                        after = build_oracle_state(session)
+                        last_stable_lp = [
+                            max(0, int(value))
+                            for value in after.get("tracked", {}).get("lp", last_stable_lp)
+                        ]
+                break
+            if correction_trace is not None and engine_rejections:
+                correction_trace["engine_rejections"] = engine_rejections
+            elapsed = time.perf_counter() - call_started
             decision_id = f"d{decision_index + 1:06d}"
             action_id = stable_id("action", [config.game_id, decision_id])
             action_summary = {
@@ -743,11 +813,7 @@ def run_evidence_duel(
                     ),
                     "validation_scope": validation_scope,
                     "exact_legal_check_performed": exact_legal_check_performed,
-                    "engine_submission_attempted": (
-                        pre_engine_error is None
-                        and executed is not None
-                        and not terminal_model_failure
-                    ),
+                    "engine_submission_attempted": engine_submission_attempted,
                     "recovery_engine_submission_attempted": step is not None,
                     "engine_error": engine_error,
                     "engine_rejection_error": engine_rejection_error,
@@ -827,7 +893,7 @@ def run_evidence_duel(
             if terminal_model_failure or decision_technical_failure:
                 break
 
-        if forfeit_winner is None:
+        if forfeit_winner is None and technical_failure_type is None:
             if session.duel.state.game_over:
                 termination = "game_over"
             elif session.duel.pending is None:

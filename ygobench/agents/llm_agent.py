@@ -145,7 +145,7 @@ def exact_legal_actions_packet(decision: DecisionRequest) -> str:
         "entry and reproduce its tool name and arguments verbatim, including "
         "argument keys and index order. Do not construct a new argument object.\n\n"
         "```json\n"
-        + json.dumps(actions, ensure_ascii=False, indent=2, default=str)
+        + json.dumps(actions, ensure_ascii=False, indent=2, sort_keys=True, default=str)
         + "\n```"
     )
 
@@ -254,7 +254,7 @@ def _card_cache_packet(cache: dict[int, dict[str, Any]]) -> str:
         "them directly and do not call inspect_cards for these card_ids again. Current "
         "zone, position, and modified stats must still be read from the state above.\n\n"
         "```json\n"
-        + json.dumps(cards, ensure_ascii=False, indent=2, default=str)
+        + json.dumps(cards, ensure_ascii=False, indent=2, sort_keys=True, default=str)
         + "\n```"
     )
 
@@ -551,8 +551,10 @@ class LLMFullDuelAgent(BaseAgent):
             self.last_trace = {"fallback": False, "error": diagnostics}
             raise ProviderProtocolError(diagnostics)
 
+        # Journals sort dict keys; serialize embedded JSON identically before/after replay.
         prompt = self._observation_template.replace(
-            "{{STATE_JSON}}", json.dumps(state, ensure_ascii=False, indent=2, default=str)
+            "{{STATE_JSON}}",
+            json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True, default=str),
         ).replace("{{REQUIRED_RESPONDER}}", responder)
         if decision.legal_actions_complete:
             prompt += exact_legal_actions_packet(decision)
@@ -678,7 +680,9 @@ class LLMFullDuelAgent(BaseAgent):
                         {
                             "role": "tool",
                             "tool_call_id": inspect_call.id,
-                            "content": json.dumps(result, ensure_ascii=False, default=str),
+                            "content": json.dumps(
+                                result, ensure_ascii=False, sort_keys=True, default=str
+                            ),
                             "is_error": not card_ids
                             or any(card.get("name") is None for card in cards),
                         }
@@ -715,7 +719,9 @@ class LLMFullDuelAgent(BaseAgent):
                             "The previous full-state attempt did not submit an action. Choose "
                             "one legal response from this correction packet and call the "
                             f"{responder} tool now:\n"
-                            + json.dumps(retry_packet, ensure_ascii=False, default=str)
+                            + json.dumps(
+                                retry_packet, ensure_ascii=False, sort_keys=True, default=str
+                            )
                         ),
                     }
                 ]
@@ -748,13 +754,12 @@ class LLMFullDuelAgent(BaseAgent):
         raise ProviderProtocolError(diagnostics)
 
     def correct_invalid_action(
-        self, decision: DecisionRequest
+        self, decision: DecisionRequest, *, rejections: list[dict[str, Any]] | None = None
     ) -> tuple[ActionChoice | None, dict[str, Any]]:
-        """Request one replacement from the authoritative legal action list.
+        """Request a replacement without treating bounded candidates as exact.
 
-        This is deliberately a narrow correction call: it cannot inspect cards
-        or select a different responder, and is used only after an attempted
-        action has failed the pre-engine exact-legal gate.
+        Engine rejection feedback contains only attempted actions and errors;
+        the observation remains the player's view, never an oracle snapshot.
         """
 
         responder = decision.decision_type
@@ -768,17 +773,31 @@ class LLMFullDuelAgent(BaseAgent):
                 for action in decision.legal_actions
             ],
         }
+        system = (
+            "Return exactly one tool call. The legal_responses list is authoritative; "
+            "choose one entry verbatim and do not provide prose."
+        )
+        if not decision.legal_actions_complete:
+            packet["candidate_responses"] = packet.pop("legal_responses")
+            packet["observation"] = decision.observation
+            cache = getattr(self, "_inspected_card_cache", {})
+            packet["inspected_cards"] = [cache[code] for code in sorted(cache)]
+            system = (
+                "Return exactly one call to the required responder and no prose. "
+                "candidate_responses is incomplete, not an authoritative legal set. "
+                "Use the observation and decision constraints to choose a valid response. "
+                "The engine will validate it. Do not repeat any rejected action."
+            )
+        if rejections:
+            packet["engine_rejections"] = rejections
         requests: list[dict[str, Any]] = []
         transport_attempts: list[dict[str, Any]] = []
         turn = self._respond_once(
-            system=(
-                "Return exactly one tool call. The legal_responses list is authoritative; "
-                "choose one entry verbatim and do not provide prose."
-            ),
+            system=system,
             messages=[
                 {
                     "role": "user",
-                    "content": json.dumps(packet, ensure_ascii=False, default=str),
+                    "content": json.dumps(packet, ensure_ascii=False, sort_keys=True, default=str),
                 }
             ],
             tools=[response_tool],
@@ -787,6 +806,7 @@ class LLMFullDuelAgent(BaseAgent):
         )
         trace = {
             "request_stage": "illegal_action_correction",
+            "requests": requests,
             "tool_calls": [
                 {"id": call.id, "name": call.name, "arguments": call.arguments}
                 for call in turn.tool_calls
