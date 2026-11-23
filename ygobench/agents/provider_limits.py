@@ -38,6 +38,14 @@ def minimum_thinking_configuration(
         or model not in _MINIMUM_THINKING_MODELS
     ):
         return None
+    if model == "gpt-6-luna" and provider_name in {"external", "openai"}:
+        return {
+            "thinking_enabled": False,
+            "reasoning_effort": "none",
+            "thinking_control": "openai.reasoning_effort",
+            "reasoning_policy": "gpt6-chat-tools-none-v1",
+            "reasoning_request": {"reasoning_effort": "none"},
+        }
     wire: dict[str, Any] = {"reasoning_effort": "low"}
     toggle = _MINIMUM_THINKING_MODELS[model]
     if toggle == "enable_thinking":
@@ -65,6 +73,10 @@ def configure_provider_thinking(
         return force_provider_thinking_disabled(
             provider, provider_name=provider_name, model_name=model_name
         )
+    if config.get("reasoning_policy") == "gpt6-chat-tools-none-v1":
+        force_openai_thinking_disabled(provider)
+        provider._ygobench_reasoning_configuration = deepcopy(config)
+        return provider
     if getattr(provider, "_ygobench_minimum_thinking", False):
         return provider
     provider.thinking_enabled = True
